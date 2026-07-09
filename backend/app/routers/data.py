@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 
 from ..db import get_session
 from ..models import Bill, DocumentRecord, Source, Subscription, Transaction
+from ..services.actions import _monthly
 from ..services.insights import build_insights
 
 router = APIRouter(prefix="/api", tags=["data"])
@@ -60,9 +61,7 @@ def get_stats(session: Session = Depends(get_session)):
     subs = session.exec(select(Subscription).where(Subscription.status == "active")).all()
     txns = session.exec(select(Transaction)).all()
     sources = session.exec(select(Source)).all()
-    monthly = sum(
-        (s.amount or 0) / (12 if s.billing_cycle == "yearly" else 1) for s in subs
-    )
+    monthly = sum(_monthly(s) for s in subs)
     today = date.today()
     this_month = sum(
         t.amount for t in txns

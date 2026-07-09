@@ -94,8 +94,12 @@ def _duplicate_signals(subs: list[Subscription]) -> list[dict]:
         combined = sum(_monthly(s) for s in group)
         saving = round(combined - _monthly(cheapest), 2)
         others = ", ".join(s.name for s in group if s.id != cheapest.id)
+        # Order-independent key (§3A.7): the signal is identified by its category + the
+        # *set* of overlapping services, so a changed group is a new signal rather than
+        # silently mutating the old ActionItem.
+        dedup_key = "duplicate:" + cat + ":" + "+".join(sorted(keys))
         out.append({
-            "kind": "duplicate", "dedup_key": f"duplicate:{cat}",
+            "kind": "duplicate", "dedup_key": dedup_key,
             "title": f"{len(group)} {cat} subscriptions overlap",
             "detail": f"You pay for {', '.join(s.name for s in group)}. Keep {cheapest.name} "
                       f"and cancel {others} to save about {cheapest.currency} {saving:.0f}/mo.",

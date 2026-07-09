@@ -21,9 +21,9 @@ SQLite: subscriptions · bills · transactions · documents
         ▼
 ┌───────────────┬──────────────────────────────┐
 │ Dashboard     │ Chat agent (tool-calling)     │
-│ renewals,     │ query_spend, list_subs,       │
+│ renewals,     │ total_spend, list_subs,       │
 │ duplicates,   │ upcoming_renewals, find_dupes,│
-│ savings       │ search_documents              │
+│ savings       │ find_documents                │
 └───────────────┴──────────────────────────────┘
 ```
 

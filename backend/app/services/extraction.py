@@ -5,6 +5,7 @@ ingest time is what makes spend questions return correct SQL sums, not LLM guess
 """
 
 from datetime import date, datetime
+from email.utils import parsedate_to_datetime
 
 from sqlmodel import Session, select
 
@@ -49,18 +50,53 @@ Rules:
 - Marketing/spam with no financial data -> all arrays empty."""
 
 
+_DATE_FORMATS = (
+    "%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%d-%m-%Y",
+    "%b %d, %Y", "%B %d, %Y", "%m/%d/%Y",
+)
+
+
 def _parse_date(value) -> date | None:
+    """Tolerant date parse (§3A.5): ISO first, then common day/month orders, then a
+    RFC-2822 email `Date` header. Never throws — returns None on anything unrecognised."""
     if not value or not isinstance(value, str):
         return None
+    s = value.strip()
+    # ISO first (handles "2026-03-14" and "2026-03-14T09:00:00").
     try:
-        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
     except ValueError:
-        return None
+        pass
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    # RFC-2822 email Date header, e.g. "Wed, 14 Mar 2026 09:00:00 +0530".
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            return dt.date()
+    except (TypeError, ValueError):
+        pass
+    return None
 
 
 def _num(value) -> float | None:
+    """Tolerant amount parse (§3A.5): strips currency symbols/codes and thousands
+    commas so "₹1,286.00", "Rs.499", "INR 8,450" all become floats. None on failure."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().lower()
+    # Order matters: "rs." before "rs" so "rs.499" doesn't leave a leading dot.
+    for token in ("inr", "rs.", "rs", "usd", "$", "₹", ",", " "):
+        s = s.replace(token, "")
+    if not s:
+        return None
     try:
-        return float(value) if value is not None else None
+        return float(s)
     except (TypeError, ValueError):
         return None
 

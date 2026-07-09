@@ -19,17 +19,30 @@ GEMINI_BASE_URL = os.getenv(
 )
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Resolve the active LLM provider: Gemini wins when its key is present, else Fireworks.
-if GEMINI_API_KEY:
-    LLM_PROVIDER = "gemini"
-    LLM_API_KEY = GEMINI_API_KEY
-    LLM_BASE_URL = GEMINI_BASE_URL
-    LLM_MODEL = GEMINI_MODEL
+# --- Unified LLM config (spec §3A.1) --------------------------------------------------
+# `LLM_PROVIDER` is first-class: gemini | fireworks | off (default off — the app runs
+# fully on seed data with no key). `LLM_API_KEY/MODEL/BASE_URL` override the per-provider
+# values. Back-compat: if LLM_PROVIDER is unset, infer it from whichever provider key is
+# present so existing .env files (GEMINI_API_KEY / FIREWORKS_API_KEY) keep working.
+_PROVIDER_DEFAULTS = {
+    "gemini": (GEMINI_BASE_URL, GEMINI_MODEL, GEMINI_API_KEY),
+    "fireworks": (FIREWORKS_BASE_URL, FIREWORKS_MODEL, FIREWORKS_API_KEY),
+}
+
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "").strip().lower()
+if not LLM_PROVIDER:
+    LLM_PROVIDER = "gemini" if GEMINI_API_KEY else ("fireworks" if FIREWORKS_API_KEY else "off")
+
+if LLM_PROVIDER == "off" or LLM_PROVIDER not in _PROVIDER_DEFAULTS:
+    LLM_PROVIDER = "off"
+    LLM_API_KEY = ""
+    LLM_BASE_URL = ""
+    LLM_MODEL = ""
 else:
-    LLM_PROVIDER = "fireworks"
-    LLM_API_KEY = FIREWORKS_API_KEY
-    LLM_BASE_URL = FIREWORKS_BASE_URL
-    LLM_MODEL = FIREWORKS_MODEL
+    _base, _model, _key = _PROVIDER_DEFAULTS[LLM_PROVIDER]
+    LLM_API_KEY = os.getenv("LLM_API_KEY", "") or _key
+    LLM_BASE_URL = os.getenv("LLM_BASE_URL", "") or _base
+    LLM_MODEL = os.getenv("LLM_MODEL", "") or _model
 
 AGENT_TOOL_MODE = os.getenv("AGENT_TOOL_MODE", "native").lower()
 
@@ -37,4 +50,8 @@ GMAIL_CREDENTIALS_FILE = str(BACKEND_DIR / os.getenv("GMAIL_CREDENTIALS_FILE", "
 GMAIL_TOKEN_FILE = str(BACKEND_DIR / os.getenv("GMAIL_TOKEN_FILE", "token.json"))
 GMAIL_MAX_MESSAGES = int(os.getenv("GMAIL_MAX_MESSAGES", "40"))
 
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BACKEND_DIR / 'data.db'}")
+# DB location: DB_PATH (relative to backend/, or absolute) builds the sqlite URL; an
+# explicit DATABASE_URL still wins if set.
+DB_PATH = os.getenv("DB_PATH", "data.db")
+_default_db_url = f"sqlite:///{DB_PATH if os.path.isabs(DB_PATH) else BACKEND_DIR / DB_PATH}"
+DATABASE_URL = os.getenv("DATABASE_URL", _default_db_url)

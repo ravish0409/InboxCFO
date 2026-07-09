@@ -9,7 +9,7 @@ from ..config import AGENT_TOOL_MODE
 from ..models import Bill, DocumentRecord, Source, Subscription, Transaction
 from .llm import _parse_json_lenient, chat_raw
 
-MAX_TURNS = 6
+MAX_TURNS = 5
 
 
 # ---------------------------------------------------------------- tool impls
@@ -28,10 +28,11 @@ def _source_ref(session: Session, source_id: int | None) -> dict | None:
     }
 
 
-def query_spend(session: Session, merchant: str = "", category: str = "",
-                start_date: str = "", end_date: str = "") -> dict:
-    stmt = select(Transaction)
-    rows = session.exec(stmt).all()
+def _spend(session: Session, merchant: str = "", category: str = "",
+           start_date: str = "", end_date: str = "") -> dict:
+    """Shared spend query — sum + list transactions filtered by merchant/category/date.
+    Exposed to the agent as three named tools (total/by-category/by-merchant) per §3.6."""
+    rows = session.exec(select(Transaction)).all()
     out = []
     for t in rows:
         if merchant and merchant.lower() not in t.merchant.lower():
@@ -58,6 +59,20 @@ def query_spend(session: Session, merchant: str = "", category: str = "",
             for t in sorted(out, key=lambda x: x.txn_date or date.min, reverse=True)[:25]
         ],
     }
+
+
+def total_spend(session: Session, start_date: str = "", end_date: str = "") -> dict:
+    return _spend(session, start_date=start_date, end_date=end_date)
+
+
+def spend_by_category(session: Session, category: str = "",
+                      start_date: str = "", end_date: str = "") -> dict:
+    return _spend(session, category=category, start_date=start_date, end_date=end_date)
+
+
+def spend_by_merchant(session: Session, merchant: str = "",
+                      start_date: str = "", end_date: str = "") -> dict:
+    return _spend(session, merchant=merchant, start_date=start_date, end_date=end_date)
 
 
 def list_subscriptions(session: Session) -> dict:
@@ -121,7 +136,7 @@ def find_duplicate_subscriptions(session: Session) -> dict:
     return {"duplicate_groups": dupes}
 
 
-def search_documents(session: Session, query: str = "") -> dict:
+def find_documents(session: Session, query: str = "") -> dict:
     q = (query or "").lower()
     docs = session.exec(select(DocumentRecord)).all()
     bills = session.exec(select(Bill)).all()
@@ -194,25 +209,41 @@ def draft_cancellation(session: Session, subscription_name: str = "") -> dict:
 
 
 TOOL_FUNCS = {
-    "query_spend": query_spend,
+    "total_spend": total_spend,
+    "spend_by_category": spend_by_category,
+    "spend_by_merchant": spend_by_merchant,
     "list_subscriptions": list_subscriptions,
     "upcoming_renewals": upcoming_renewals,
     "find_duplicate_subscriptions": find_duplicate_subscriptions,
-    "search_documents": search_documents,
+    "find_documents": find_documents,
     "list_action_items": list_action_items,
     "draft_cancellation": draft_cancellation,
 }
 
 TOOL_SCHEMAS = [
     {"type": "function", "function": {
-        "name": "query_spend",
-        "description": "Sum and list transactions, optionally filtered by merchant substring, category, and ISO date range. Use this for any 'how much did I spend' question.",
+        "name": "total_spend",
+        "description": "Sum and list ALL transactions, optionally within an ISO date range. Use for overall 'how much did I spend' questions with no merchant or category filter.",
         "parameters": {"type": "object", "properties": {
-            "merchant": {"type": "string", "description": "merchant name substring, e.g. 'swiggy'"},
-            "category": {"type": "string", "description": "one of food|shopping|transport|entertainment|bills|other"},
             "start_date": {"type": "string", "description": "YYYY-MM-DD inclusive"},
             "end_date": {"type": "string", "description": "YYYY-MM-DD inclusive"}},
             "required": []}}},
+    {"type": "function", "function": {
+        "name": "spend_by_category",
+        "description": "Sum and list transactions in ONE category, optionally within an ISO date range.",
+        "parameters": {"type": "object", "properties": {
+            "category": {"type": "string", "description": "one of food|shopping|transport|entertainment|bills|other"},
+            "start_date": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+            "end_date": {"type": "string", "description": "YYYY-MM-DD inclusive"}},
+            "required": ["category"]}}},
+    {"type": "function", "function": {
+        "name": "spend_by_merchant",
+        "description": "Sum and list transactions for ONE merchant (substring match), optionally within an ISO date range. Use for 'how much did I spend on <merchant>'.",
+        "parameters": {"type": "object", "properties": {
+            "merchant": {"type": "string", "description": "merchant name substring, e.g. 'swiggy'"},
+            "start_date": {"type": "string", "description": "YYYY-MM-DD inclusive"},
+            "end_date": {"type": "string", "description": "YYYY-MM-DD inclusive"}},
+            "required": ["merchant"]}}},
     {"type": "function", "function": {
         "name": "list_subscriptions",
         "description": "List all active subscriptions with cost, billing cycle and next renewal.",
@@ -227,7 +258,7 @@ TOOL_SCHEMAS = [
         "description": "Find overlapping subscriptions in the same category (e.g. two music services).",
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
-        "name": "search_documents",
+        "name": "find_documents",
         "description": "Keyword search over stored documents (insurance policies, warranties, statements) and bills. Use for expiry/renewal/policy questions.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "keywords, e.g. 'car insurance'"}}, "required": ["query"]}}},
@@ -249,8 +280,8 @@ subscriptions, bills, transactions, insurance and documents using ONLY the provi
 Today's date is {today}. Default currency is INR (₹).
 
 Rules:
-- Always call a tool before answering a factual question. For spend questions use query_spend with date filters
-  (e.g. "last month" = the previous calendar month).
+- Always call a tool before answering a factual question. For spend questions use total_spend (overall),
+  spend_by_category, or spend_by_merchant with date filters (e.g. "last month" = the previous calendar month).
 - Quote exact totals returned by tools; do not recompute or round differently.
 - Be concise and friendly. Mention the source email/document when the tool result includes one.
 - For "what should I cancel / what needs my attention / anything ending soon", call list_action_items.
@@ -263,9 +294,9 @@ JSON_MODE_SUFFIX = """
 
 You do not have native tool-calling. Instead reply with EXACTLY ONE JSON object per turn, no other text:
 - To call a tool: {"tool": "<name>", "args": {...}}
-  Available tools: query_spend(merchant?, category?, start_date?, end_date?), list_subscriptions(),
-  upcoming_renewals(days?), find_duplicate_subscriptions(), search_documents(query),
-  list_action_items(), draft_cancellation(subscription_name)
+  Available tools: total_spend(start_date?, end_date?), spend_by_category(category, start_date?, end_date?),
+  spend_by_merchant(merchant, start_date?, end_date?), list_subscriptions(), upcoming_renewals(days?),
+  find_duplicate_subscriptions(), find_documents(query), list_action_items(), draft_cancellation(subscription_name)
 - To answer the user: {"answer": "<your final answer>"}"""
 
 
