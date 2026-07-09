@@ -272,7 +272,7 @@ A `duplicate` signal spans a *group* of subs, but Draft cancellation acts on **o
 ### Phase 0 — Scaffold (≈30 min)
 **Goal:** both servers boot and talk to each other.
 - `backend/`: `requirements.txt` (fastapi, uvicorn, sqlmodel, python-dotenv, openai, google-api-python-client, google-auth-oauthlib, pypdf), `app/main.py` (FastAPI + CORS to Vite), `app/config.py` (env: `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_MODEL`, `LLM_BASE_URL`), `app/db.py` (engine + `init_db()`), `.env.example`.
-- `frontend/`: `npm create vite@latest` (React), add Tailwind + Recharts, a Vite dev-proxy `/api → :8000`.
+- `frontend/`: `pnpm create vite@latest` (React), add Tailwind + Recharts, a Vite dev-proxy `/api → :8000`.
 - **Demo checkpoint:** `GET /api/health` returns `{ok:true}`; Vite page fetches it and prints "connected".
 
 ### Phase 1 — Data foundation + read-only dashboard (≈2–3 hrs) ← *build this first*
@@ -286,7 +286,7 @@ A `duplicate` signal spans a *group* of subs, but Draft cancellation acts on **o
   Netflix price hike (499→649), Audible trial ending in 2 days, Spotify + YouTube Music (music duplicate),
   car insurance renewal, electricity bill, a month of Swiggy charges. Wipe-then-seed.
 - Frontend: `Dashboard.jsx` + `App.jsx` render stats, chart, subscriptions, renewals; `SourceModal`.
-- **Demo checkpoint:** `python seed.py && uvicorn` + `npm run dev` → dashboard shows real numbers, the
+- **Demo checkpoint:** `python seed.py && uvicorn` + `pnpm dev` → dashboard shows real numbers, the
   spend chart draws, clicking a 📎 opens the source email. **This alone is demoable.**
 
 ### Phase 2 — Ingest + extraction (≈3 hrs)
@@ -336,7 +336,7 @@ A `duplicate` signal spans a *group* of subs, but Draft cancellation acts on **o
 
 ### Phase 5 — Polish + demo script (≈1–2 hrs)
 - Empty states, loading states, error banners; make a missing key show a friendly note, not a stack trace.
-- `README.md`: 3-command run (`pip install -r`, `python seed.py`, `uvicorn` / `npm run dev`).
+- `README.md`: 3-command run (`uv pip install -r`, `python seed.py`, `uvicorn` / `pnpm dev`).
 - **Rehearse the 3-minute demo (below).** Reset with `python seed.py` right before presenting.
 
 ---
