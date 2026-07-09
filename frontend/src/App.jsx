@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import { Chat } from './components/Chat'
 import { SourceModal } from './components/SourceModal'
+import { ActionCenter } from './components/ActionCenter'
 import {
-  DuplicateBanner, InsightsPanel, RenewalList, SpendChart, StatsBar, SubscriptionList,
+  InsightsPanel, RenewalList, SpendChart, StatsBar, SubscriptionList,
 } from './components/Dashboard'
 
 export default function App() {
@@ -11,19 +12,21 @@ export default function App() {
   const [subscriptions, setSubscriptions] = useState([])
   const [spend, setSpend] = useState([])
   const [insights, setInsights] = useState(null)
+  const [actionItems, setActionItems] = useState([])
   const [sourceId, setSourceId] = useState(null)
   const [banner, setBanner] = useState(null) // {kind: 'ok'|'err', text}
   const [working, setWorking] = useState('') // 'sync' | 'upload' | ''
   const fileRef = useRef(null)
 
   const refresh = useCallback(async () => {
-    const [st, subs, sp, ins] = await Promise.allSettled([
-      api.stats(), api.subscriptions(), api.spendByMonth(), api.insights(),
+    const [st, subs, sp, ins, act] = await Promise.allSettled([
+      api.stats(), api.subscriptions(), api.spendByMonth(), api.insights(), api.actions(),
     ])
     if (st.status === 'fulfilled') setStats(st.value)
     if (subs.status === 'fulfilled') setSubscriptions(subs.value)
     if (sp.status === 'fulfilled') setSpend(sp.value)
     if (ins.status === 'fulfilled') setInsights(ins.value)
+    if (act.status === 'fulfilled') setActionItems(act.value)
   }, [])
 
   useEffect(() => { refresh() }, [refresh])
@@ -95,10 +98,10 @@ export default function App() {
       )}
 
       <StatsBar stats={stats} />
-      <DuplicateBanner insights={insights} />
 
       <div className="grid lg:grid-cols-3 gap-4 flex-1 min-h-0">
         <div className="lg:col-span-2 space-y-5">
+          <ActionCenter items={actionItems} onShowSource={setSourceId} onRefresh={refresh} />
           <SubscriptionList subscriptions={subscriptions.filter((s) => s.status === 'active')}
                             onShowSource={setSourceId} />
           <div className="grid xl:grid-cols-2 gap-5">

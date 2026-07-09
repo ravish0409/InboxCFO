@@ -30,20 +30,59 @@ def get_client() -> OpenAI:
     return _client
 
 
-def chat_json(system: str, user: str, temperature: float = 0.0) -> dict:
-    """One-shot completion forced into JSON mode. Returns the parsed object."""
+def chat_json(
+    system: str,
+    user: str,
+    temperature: float = 0.0,
+    *,
+    require_keys: list[str] | None = None,
+    retries: int = 1,
+) -> dict:
+    """One-shot completion forced into JSON mode. Returns the parsed object.
+
+    Retries up to `retries` times if the model returns unparseable JSON or omits
+    any of `require_keys` — a bad/partial call otherwise silently drops records.
+    Raises the last error if every attempt fails.
+    """
+    client = get_client()
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        resp = client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=temperature,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        content = resp.choices[0].message.content or "{}"
+        try:
+            data = _parse_json_lenient(content)
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            continue
+        if require_keys and not all(k in data for k in require_keys):
+            last_error = ValueError(
+                f"response missing required keys {require_keys}; got {list(data)}"
+            )
+            continue
+        return data
+    raise last_error or ValueError("chat_json failed with no response")
+
+
+def chat_text(system: str, user: str, temperature: float = 0.3) -> str:
+    """One-shot completion returning free-form text (e.g. a drafted email)."""
     client = get_client()
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         temperature=temperature,
-        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
     )
-    content = resp.choices[0].message.content or "{}"
-    return _parse_json_lenient(content)
+    return (resp.choices[0].message.content or "").strip()
 
 
 def chat_raw(messages: list[dict], tools: list[dict] | None = None, temperature: float = 0.1):

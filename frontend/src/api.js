@@ -17,6 +17,11 @@ export const api = {
   insights: () => request('/api/insights'),
   source: (id) => request(`/api/sources/${id}`),
   sync: () => request('/api/sync', { method: 'POST' }),
+  actions: () => request('/api/actions'),
+  refreshActions: () => request('/api/actions/refresh', { method: 'POST' }),
+  draftAction: (id) => request(`/api/actions/${id}/draft`, { method: 'POST' }),
+  approveAction: (id) => request(`/api/actions/${id}/approve`, { method: 'POST' }),
+  dismissAction: (id) => request(`/api/actions/${id}/dismiss`, { method: 'POST' }),
   chat: (question, history) =>
     request('/api/chat', {
       method: 'POST',

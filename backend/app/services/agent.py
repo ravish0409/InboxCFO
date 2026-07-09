@@ -144,12 +144,63 @@ def search_documents(session: Session, query: str = "") -> dict:
     return {"results": results[:20]}
 
 
+def list_action_items(session: Session) -> dict:
+    """Trials ending, renewals due, price hikes and duplicates the user should review."""
+    from .actions import list_action_items as _list
+    items = _list(session)
+    return {
+        "action_items": [
+            {
+                "id": a.id, "kind": a.kind, "title": a.title, "detail": a.detail,
+                "severity": a.severity, "estimated_saving": a.estimated_saving,
+                "currency": a.currency, "status": a.status,
+                "source": _source_ref(session, a.source_id),
+            }
+            for a in items
+        ]
+    }
+
+
+def draft_cancellation(session: Session, subscription_name: str = "") -> dict:
+    """Draft (do NOT send) a cancellation email for a subscription by name."""
+    from .actions import draft_cancellation as _draft
+    from .actions import refresh_action_items
+    from .normalize import norm_key
+    from ..models import ActionItem, Subscription
+
+    key = norm_key(subscription_name)
+    if not key:
+        return {"error": "please name the subscription to cancel"}
+    sub = session.exec(
+        select(Subscription).where(Subscription.norm_key == key,
+                                   Subscription.status == "active")
+    ).first()
+    if sub is None:
+        return {"error": f"no active subscription matching '{subscription_name}'"}
+
+    item = session.exec(
+        select(ActionItem).where(ActionItem.subscription_id == sub.id)
+    ).first()
+    if item is None:
+        # User wants to cancel something we didn't flag — make an ad-hoc action so
+        # the draft also shows up in the Action Center.
+        item = ActionItem(kind="manual_cancel", dedup_key=f"manual_cancel:{sub.id}",
+                          title=f"Cancel {sub.name}", severity="low",
+                          subscription_id=sub.id, source_id=sub.source_id, status="open")
+        session.add(item)
+        session.commit()
+        session.refresh(item)
+    return _draft(session, item.id)
+
+
 TOOL_FUNCS = {
     "query_spend": query_spend,
     "list_subscriptions": list_subscriptions,
     "upcoming_renewals": upcoming_renewals,
     "find_duplicate_subscriptions": find_duplicate_subscriptions,
     "search_documents": search_documents,
+    "list_action_items": list_action_items,
+    "draft_cancellation": draft_cancellation,
 }
 
 TOOL_SCHEMAS = [
@@ -180,6 +231,16 @@ TOOL_SCHEMAS = [
         "description": "Keyword search over stored documents (insurance policies, warranties, statements) and bills. Use for expiry/renewal/policy questions.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "keywords, e.g. 'car insurance'"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "list_action_items",
+        "description": "List things the user should review right now: free trials ending soon, subscriptions auto-renewing soon, price increases, and duplicate subscriptions. Use for 'what should I cancel', 'anything ending soon', 'what needs my attention'.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "draft_cancellation",
+        "description": "Draft (never send) a polite cancellation email for a subscription by name. Use when the user asks to cancel something or accepts your offer to draft a cancellation.",
+        "parameters": {"type": "object", "properties": {
+            "subscription_name": {"type": "string", "description": "the service to cancel, e.g. 'Audible'"}},
+            "required": ["subscription_name"]}}},
 ]
 
 SYSTEM_PROMPT = """You are "Inbox CFO", a personal finance assistant. You answer questions about the user's
@@ -192,6 +253,10 @@ Rules:
   (e.g. "last month" = the previous calendar month).
 - Quote exact totals returned by tools; do not recompute or round differently.
 - Be concise and friendly. Mention the source email/document when the tool result includes one.
+- For "what should I cancel / what needs my attention / anything ending soon", call list_action_items.
+  If it surfaces a free trial ending or a duplicate, proactively OFFER to draft a cancellation.
+- When the user asks to cancel something (or accepts your offer), call draft_cancellation with the name.
+  You draft the email for their approval — you never send it. Tell them it's a draft to review and send.
 - If a tool returns nothing relevant, say you couldn't find it in the ingested data."""
 
 JSON_MODE_SUFFIX = """
@@ -199,7 +264,8 @@ JSON_MODE_SUFFIX = """
 You do not have native tool-calling. Instead reply with EXACTLY ONE JSON object per turn, no other text:
 - To call a tool: {"tool": "<name>", "args": {...}}
   Available tools: query_spend(merchant?, category?, start_date?, end_date?), list_subscriptions(),
-  upcoming_renewals(days?), find_duplicate_subscriptions(), search_documents(query)
+  upcoming_renewals(days?), find_duplicate_subscriptions(), search_documents(query),
+  list_action_items(), draft_cancellation(subscription_name)
 - To answer the user: {"answer": "<your final answer>"}"""
 
 

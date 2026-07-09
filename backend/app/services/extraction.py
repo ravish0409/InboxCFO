@@ -6,10 +6,18 @@ ingest time is what makes spend questions return correct SQL sums, not LLM guess
 
 from datetime import date, datetime
 
-from sqlmodel import Session
+from sqlmodel import Session, select
 
+from ..categories import (
+    BILL_CATEGORIES,
+    DOCUMENT_TYPES,
+    SUBSCRIPTION_CATEGORIES,
+    TRANSACTION_CATEGORIES,
+    coerce,
+)
 from ..models import Bill, DocumentRecord, Source, Subscription, Transaction
 from .llm import chat_json
+from .normalize import content_hash, norm_key
 
 EXTRACTION_SYSTEM = """You are a precise financial document parser. You receive the text of ONE email or document.
 Extract structured records. Output ONLY a JSON object with this exact shape (all arrays may be empty):
@@ -17,7 +25,8 @@ Extract structured records. Output ONLY a JSON object with this exact shape (all
 {
   "subscriptions": [{"name": str, "category": "music|video|food|cloud|news|fitness|other",
                      "amount": number|null, "currency": str, "billing_cycle": "monthly|yearly|weekly",
-                     "next_renewal": "YYYY-MM-DD"|null}],
+                     "next_renewal": "YYYY-MM-DD"|null, "is_trial": bool, "trial_end_date": "YYYY-MM-DD"|null,
+                     "auto_renews": bool, "cancel_url": str}],
   "bills": [{"name": str, "category": "utility|insurance|rent|telecom|other", "amount": number|null,
              "currency": str, "due_date": "YYYY-MM-DD"|null, "status": "due|paid"}],
   "transactions": [{"merchant": str, "category": "food|shopping|transport|entertainment|bills|other",
@@ -29,6 +38,9 @@ Extract structured records. Output ONLY a JSON object with this exact shape (all
 
 Rules:
 - A recurring service receipt/renewal (Netflix, Spotify, etc.) -> one "subscriptions" entry AND one "transactions" entry if a charge occurred.
+- A "your free trial ends" / "trial ending" email -> subscription with is_trial=true and trial_end_date set (the date the trial converts to paid). No transaction yet.
+- If the email says the plan auto-renews (or is silent) set auto_renews=true; if it says it will NOT renew, set auto_renews=false.
+- If the email contains a cancellation/manage-subscription link, put the full URL in cancel_url; else "".
 - A bank debit/credit alert -> "transactions" only.
 - A utility/insurance bill or renewal notice -> "bills" (and "documents" if it is a policy with an expiry date).
 - Insurance policies, warranties -> "documents" with expiry_date. Set summary to one useful sentence.
@@ -53,6 +65,65 @@ def _num(value) -> float | None:
         return None
 
 
+def _upsert_subscription(session: Session, source: Source, s: dict, counts: dict) -> None:
+    """A recurring service (monthly Netflix email) updates its existing row rather
+    than inserting a new one each cycle — otherwise duplicate-detection and the
+    total-monthly-cost sum are meaningless."""
+    key = norm_key(s.get("name"))
+    existing = None
+    if key:
+        existing = session.exec(
+            select(Subscription).where(
+                Subscription.norm_key == key, Subscription.status == "active"
+            )
+        ).first()
+    amount = _num(s.get("amount"))
+    next_renewal = _parse_date(s.get("next_renewal"))
+    is_trial = bool(s.get("is_trial"))
+    trial_end = _parse_date(s.get("trial_end_date"))
+    cancel_url = (s.get("cancel_url") or "").strip()
+    auto_renews = s.get("auto_renews")
+    if existing:
+        # Keep the freshest signal from the newer source; don't overwrite good data with null.
+        if amount is not None:
+            # A price change is exactly the signal a bank feed can't see until after the charge.
+            if existing.amount is not None and amount != existing.amount:
+                existing.previous_amount = existing.amount
+                existing.price_change_at = source.received_at or date.today()
+            existing.amount = amount
+        if next_renewal is not None:
+            existing.next_renewal = next_renewal
+        if trial_end is not None:
+            existing.trial_end_date = trial_end
+        if is_trial:
+            existing.is_trial = True
+        if cancel_url:
+            existing.cancel_url = cancel_url
+        if auto_renews is not None:
+            existing.auto_renews = bool(auto_renews)
+        existing.category = coerce(s.get("category"), SUBSCRIPTION_CATEGORIES)
+        existing.billing_cycle = s.get("billing_cycle") or existing.billing_cycle
+        existing.source_id = source.id
+        session.add(existing)
+        counts["subscriptions_updated"] += 1
+    else:
+        session.add(Subscription(
+            source_id=source.id,
+            name=str(s["name"]).strip(),
+            norm_key=key,
+            category=coerce(s.get("category"), SUBSCRIPTION_CATEGORIES),
+            amount=amount,
+            currency=s.get("currency") or "INR",
+            billing_cycle=s.get("billing_cycle") or "monthly",
+            next_renewal=next_renewal,
+            is_trial=is_trial,
+            trial_end_date=trial_end,
+            cancel_url=cancel_url,
+            auto_renews=bool(auto_renews) if auto_renews is not None else True,
+        ))
+        counts["subscriptions"] += 1
+
+
 def extract_source(session: Session, source: Source) -> dict:
     """Run LLM extraction for one stored Source and persist the typed rows."""
     user = (
@@ -62,33 +133,43 @@ def extract_source(session: Session, source: Source) -> dict:
         f"Today's date: {date.today().isoformat()}\n\n"
         f"--- CONTENT ---\n{source.raw_text[:12000]}"
     )
-    data = chat_json(EXTRACTION_SYSTEM, user)
-    counts = {"subscriptions": 0, "bills": 0, "transactions": 0, "documents": 0}
+    data = chat_json(
+        EXTRACTION_SYSTEM, user,
+        require_keys=["subscriptions", "bills", "transactions", "documents"],
+    )
+    counts = {
+        "subscriptions": 0, "subscriptions_updated": 0,
+        "bills": 0, "transactions": 0, "documents": 0,
+    }
 
     for s in data.get("subscriptions") or []:
         if not s.get("name"):
             continue
-        session.add(Subscription(
-            source_id=source.id,
-            name=str(s["name"]).strip(),
-            category=s.get("category") or "other",
-            amount=_num(s.get("amount")),
-            currency=s.get("currency") or "INR",
-            billing_cycle=s.get("billing_cycle") or "monthly",
-            next_renewal=_parse_date(s.get("next_renewal")),
-        ))
-        counts["subscriptions"] += 1
+        _upsert_subscription(session, source, s, counts)
 
     for b in data.get("bills") or []:
         if not b.get("name"):
             continue
+        due = _parse_date(b.get("due_date"))
+        key = norm_key(b.get("name"))
+        # A bill for the same provider + same due date is the same obligation.
+        existing = session.exec(
+            select(Bill).where(Bill.name == str(b["name"]).strip(), Bill.due_date == due)
+        ).first() if key else None
+        if existing:
+            if _num(b.get("amount")) is not None:
+                existing.amount = _num(b.get("amount"))
+            existing.status = b.get("status") or existing.status
+            existing.source_id = source.id
+            session.add(existing)
+            continue
         session.add(Bill(
             source_id=source.id,
             name=str(b["name"]).strip(),
-            category=b.get("category") or "utility",
+            category=coerce(b.get("category"), BILL_CATEGORIES, default="utility"),
             amount=_num(b.get("amount")),
             currency=b.get("currency") or "INR",
-            due_date=_parse_date(b.get("due_date")),
+            due_date=due,
             status=b.get("status") or "due",
         ))
         counts["bills"] += 1
@@ -97,10 +178,12 @@ def extract_source(session: Session, source: Source) -> dict:
         amount = _num(t.get("amount"))
         if not t.get("merchant") or amount is None:
             continue
+        # Individual charges are never deduped by name — each is a real event.
+        # Re-ingesting the same source is prevented upstream by the content hash.
         session.add(Transaction(
             source_id=source.id,
             merchant=str(t["merchant"]).strip(),
-            category=t.get("category") or "other",
+            category=coerce(t.get("category"), TRANSACTION_CATEGORIES),
             amount=amount,
             currency=t.get("currency") or "INR",
             txn_date=_parse_date(t.get("txn_date")) or source.received_at,
@@ -111,12 +194,30 @@ def extract_source(session: Session, source: Source) -> dict:
     for d in data.get("documents") or []:
         if not d.get("title"):
             continue
+        title = str(d["title"]).strip()
+        provider = d.get("provider") or ""
+        # Same policy/warranty re-notified -> update expiry/amount, don't duplicate.
+        existing = session.exec(
+            select(DocumentRecord).where(
+                DocumentRecord.title == title, DocumentRecord.provider == provider
+            )
+        ).first()
+        expiry = _parse_date(d.get("expiry_date"))
+        if existing:
+            if expiry is not None:
+                existing.expiry_date = expiry
+            if _num(d.get("amount")) is not None:
+                existing.amount = _num(d.get("amount"))
+            existing.summary = d.get("summary") or existing.summary
+            existing.source_id = source.id
+            session.add(existing)
+            continue
         session.add(DocumentRecord(
             source_id=source.id,
-            doc_type=d.get("doc_type") or "other",
-            title=str(d["title"]).strip(),
-            provider=d.get("provider") or "",
-            expiry_date=_parse_date(d.get("expiry_date")),
+            doc_type=coerce(d.get("doc_type"), DOCUMENT_TYPES),
+            title=title,
+            provider=provider,
+            expiry_date=expiry,
             amount=_num(d.get("amount")),
             currency=d.get("currency") or "INR",
             summary=d.get("summary") or "",
@@ -125,6 +226,13 @@ def extract_source(session: Session, source: Source) -> dict:
 
     session.commit()
     return counts
+
+
+def find_source_by_hash(session: Session, digest: str) -> Source | None:
+    """Return an already-ingested source with this content fingerprint, if any."""
+    if not digest:
+        return None
+    return session.exec(select(Source).where(Source.content_hash == digest)).first()
 
 
 def store_source(
@@ -145,6 +253,7 @@ def store_source(
         snippet=raw_text.strip().replace("\n", " ")[:300],
         raw_text=raw_text,
         external_id=external_id,
+        content_hash=content_hash(sender, title, raw_text),
     )
     session.add(source)
     session.commit()

@@ -6,10 +6,11 @@ Wipes existing data first.
 
 from datetime import date, timedelta
 
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
 from app.db import engine, init_db
 from app.models import Bill, DocumentRecord, Source, Subscription, Transaction
+from app.services.normalize import content_hash, norm_key
 
 TODAY = date.today()
 FIRST_OF_MONTH = TODAY.replace(day=1)
@@ -22,7 +23,8 @@ def lm(day: int) -> date:  # a date in last month
 
 def src(session: Session, title: str, sender: str, received: date, body: str, source_type="email") -> int:
     s = Source(source_type=source_type, title=title, sender=sender, received_at=received,
-               snippet=body.strip().replace("\n", " ")[:300], raw_text=body)
+               snippet=body.strip().replace("\n", " ")[:300], raw_text=body,
+               content_hash=content_hash(sender, title, body))
     session.add(s)
     session.commit()
     session.refresh(s)
@@ -36,10 +38,11 @@ def main() -> None:
 
     with Session(engine) as session:
         # --- Subscriptions (note: TWO music services -> duplicate demo) ---
-        s1 = src(session, "Your Netflix payment receipt", "Netflix <info@netflix.com>", lm(3),
-                 "Hi, we've received your payment of ₹649.00 for your Netflix Premium plan. "
-                 f"Your next billing date is {(TODAY + timedelta(days=8)).isoformat()}.")
+        s1 = src(session, "Your Netflix plan price is changing", "Netflix <info@netflix.com>", lm(3),
+                 "Hi, your Netflix Premium plan price is increasing from ₹499.00 to ₹649.00. "
+                 f"We've received your payment of ₹649.00. Next billing date {(TODAY + timedelta(days=8)).isoformat()}.")
         session.add(Subscription(source_id=s1, name="Netflix", category="video", amount=649,
+                                 previous_amount=499, price_change_at=lm(3),
                                  billing_cycle="monthly", next_renewal=TODAY + timedelta(days=8)))
         session.add(Transaction(source_id=s1, merchant="Netflix", category="entertainment",
                                 amount=649, txn_date=lm(3), description="Netflix Premium monthly"))
@@ -56,7 +59,8 @@ def main() -> None:
                  "Thanks for your purchase. YouTube Music Premium: ₹99.00/month. "
                  f"Renews {(TODAY + timedelta(days=14)).isoformat()}.")
         session.add(Subscription(source_id=s3, name="YouTube Music", category="music", amount=99,
-                                 billing_cycle="monthly", next_renewal=TODAY + timedelta(days=14)))
+                                 billing_cycle="monthly", next_renewal=TODAY + timedelta(days=14),
+                                 cancel_url="https://play.google.com/store/account/subscriptions"))
         session.add(Transaction(source_id=s3, merchant="Google Play (YouTube Music)", category="entertainment",
                                 amount=99, txn_date=lm(9), description="YouTube Music Premium"))
 
@@ -66,6 +70,18 @@ def main() -> None:
                  f"Valid until {(TODAY + timedelta(days=285)).isoformat()}.")
         session.add(Subscription(source_id=s4, name="Amazon Prime", category="video", amount=1499,
                                  billing_cycle="yearly", next_renewal=TODAY + timedelta(days=285)))
+
+        # --- Audible free trial about to convert (the trial-trap interception demo) ---
+        s4b = src(session, "Your Audible free trial ends soon", "Audible <no-reply@audible.in>",
+                  TODAY - timedelta(days=28),
+                  "Your 30-day Audible free trial ends on "
+                  f"{(TODAY + timedelta(days=2)).isoformat()}. After that you'll be charged ₹199/month. "
+                  "Manage or cancel anytime at https://www.audible.in/account/membership.")
+        session.add(Subscription(source_id=s4b, name="Audible", category="other", amount=199,
+                                 billing_cycle="monthly", is_trial=True,
+                                 trial_end_date=TODAY + timedelta(days=2),
+                                 next_renewal=TODAY + timedelta(days=2),
+                                 cancel_url="https://www.audible.in/account/membership"))
 
         # --- Car insurance (the canonical question) ---
         s5 = src(session, "Your car insurance policy — renewal notice", "ICICI Lombard <care@icicilombard.com>",
@@ -118,7 +134,15 @@ def main() -> None:
                                    provider="Dell", expiry_date=TODAY + timedelta(days=165), amount=124990,
                                    summary="Laptop warranty with onsite support."))
 
+        # Backfill norm_key so seeded subscriptions participate in upsert/dedup.
+        for sub in session.exec(select(Subscription)).all():
+            sub.norm_key = norm_key(sub.name)
+            session.add(sub)
         session.commit()
+
+        # Generate the initial action items (trial ending, price hike, duplicates).
+        from app.services.actions import refresh_action_items
+        refresh_action_items(session)
 
     swiggy_total = sum(a for _, a in swiggy)
     print(f"Seeded. Last month Swiggy total = Rs.{swiggy_total:.2f} "
