@@ -4,7 +4,7 @@ import { api, fmtRel } from '../api'
 import { useChatSessions } from '../chatStore'
 import { EvidenceChip } from './Evidence'
 import { Markdown } from './Markdown'
-import { btn, focusRing } from '../ui'
+import { focusRing } from '../ui'
 
 const SUGGESTIONS = [
   'When does my car insurance expire?',
@@ -50,7 +50,7 @@ function TypingDots() {
     <span className="inline-flex items-center gap-1 py-0.5" aria-label="Assistant is typing">
       {[0, 1, 2].map((i) => (
         <span key={i} className="inline-block w-1.5 h-1.5 rounded-full bg-faint motion-safe:animate-pulse"
-              style={{ animationDelay: `${i * 150}ms` }} />
+          style={{ animationDelay: `${i * 150}ms` }} />
       ))}
     </span>
   )
@@ -66,9 +66,8 @@ function HistoryPanel({ sessions, activeId, onOpen, onRemove, onClose }) {
       {sessions.map((s) => (
         <div
           key={s.id}
-          className={`group flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors duration-150 ${
-            s.id === activeId ? 'border-accent bg-accent-soft' : 'border-line hover:border-line-strong hover:bg-inset'
-          }`}
+          className={`group flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors duration-150 ${s.id === activeId ? 'border-accent bg-accent-soft' : 'border-line hover:border-line-strong hover:bg-inset'
+            }`}
         >
           <button
             onClick={() => { onOpen(s.id); onClose() }}
@@ -103,6 +102,17 @@ export function Chat({ onShowSource, onBusy, onClose }) {
   // commit never fires with a stale (wrong-conversation) message list mid-load.
   const [loadedFor, setLoadedFor] = useState(null)
   const bottomRef = useRef(null)
+  const inputRef = useRef(null)
+
+  // Grow the textarea with its content, up to a cap, then let it scroll — the
+  // standard chat-composer behaviour (ChatGPT/Slack).
+  function autosize() {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  }
+  useEffect(autosize, [input])
 
   // Load a conversation's messages whenever the active conversation changes
   // (startup, switching from history, or starting a new chat).
@@ -196,9 +206,8 @@ export function Chat({ onShowSource, onBusy, onClose }) {
           aria-label="Chat history"
           aria-pressed={showHistory}
           title="Chat history"
-          className={`transition-colors duration-150 rounded-md p-1 cursor-pointer ${focusRing} ${
-            showHistory ? 'text-accent' : 'text-faint hover:text-ink'
-          }`}
+          className={`transition-colors duration-150 rounded-md p-1 cursor-pointer ${focusRing} ${showHistory ? 'text-accent' : 'text-faint hover:text-ink'
+            }`}
         >
           <History size={16} strokeWidth={1.75} />
         </button>
@@ -229,73 +238,97 @@ export function Chat({ onShowSource, onBusy, onClose }) {
         />
       )}
       {!showHistory && (
-      <>
+        <>
 
 
-      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
-        {!messages.length && (
-          <div className="space-y-2">
-            <p className="text-sm text-dim mb-3">
-              Ask anything about your subscriptions, bills, or spending — answers come from your ingested emails.
-            </p>
-            {SUGGESTIONS.map((s) => (
-              <button key={s} onClick={() => ask(s)}
-                      className={`block w-full text-left text-sm text-dim bg-card border border-line rounded-lg px-3 py-2 transition-colors duration-150 hover:border-line-strong hover:text-ink cursor-pointer ${focusRing}`}>
-                {s}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {messages.map((m, i) => {
-          const isAssistant = m.role === 'assistant'
-          const plainText = m.role === 'user' || m.error
-          return (
-            <div key={i} className="fade-in">
-              {isAssistant && !m.error && <WorkReceipt trace={m.trace} />}
-              <div className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
-                <div className={`max-w-[85%] text-sm px-3.5 py-2.5 ${plainText ? 'whitespace-pre-wrap' : ''} ${
-                  m.role === 'user'
-                    ? 'bg-ink text-white rounded-2xl rounded-br-md'
-                    : m.error
-                      ? 'bg-alert-soft text-alert rounded-2xl rounded-bl-md'
-                      : 'bg-inset text-ink rounded-2xl rounded-bl-md'
-                }`}>
-                  {isAssistant && !m.error
-                    ? (m.content
-                        ? <Markdown>{m.content}</Markdown>
-                        : m.streaming && <TypingDots />)
-                    : m.content}
-                  {!!m.sources?.length && (
-                    <div className="mt-2 pt-2 border-t border-line-strong/40 flex flex-wrap gap-1.5">
-                      {m.sources.slice(0, 4).map((s) => (
-                        <EvidenceChip
-                          key={s.source_id}
-                          label={s.title}
-                          title={`${s.sender || ''} ${s.date || ''}`.trim()}
-                          onClick={() => onShowSource(s.source_id)}
-                        />
-                      ))}
-                    </div>
-                  )}
-                </div>
+          <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+            {!messages.length && (
+              <div className="space-y-2">
+                <p className="text-sm text-dim mb-3">
+                  Ask anything about your subscriptions, bills, or spending — answers come from your ingested emails.
+                </p>
+                {SUGGESTIONS.map((s) => (
+                  <button key={s} onClick={() => ask(s)}
+                    className={`block w-full text-left text-sm text-dim bg-card border border-line rounded-lg px-3 py-2 transition-colors duration-150 hover:border-line-strong hover:text-ink cursor-pointer ${focusRing}`}>
+                    {s}
+                  </button>
+                ))}
               </div>
-            </div>
-          )
-        })}
-        <div ref={bottomRef} />
-      </div>
+            )}
 
-      <form className="shrink-0 p-3 border-t border-line flex gap-2"
+            {messages.map((m, i) => {
+              const isAssistant = m.role === 'assistant'
+              const plainText = m.role === 'user' || m.error
+              return (
+                <div key={i} className="fade-in">
+                  {isAssistant && !m.error && <WorkReceipt trace={m.trace} />}
+                  <div className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+                    <div className={`max-w-[85%] text-sm px-3.5 py-2.5 ${plainText ? 'whitespace-pre-wrap' : ''} ${m.role === 'user'
+                      ? 'bg-ink text-white rounded-2xl rounded-br-md'
+                      : m.error
+                        ? 'bg-alert-soft text-alert rounded-2xl rounded-bl-md'
+                        : 'bg-inset text-ink rounded-2xl rounded-bl-md'
+                      }`}>
+                      {isAssistant && !m.error
+                        ? (m.content
+                          ? <Markdown>{m.content}</Markdown>
+                          : m.streaming && <TypingDots />)
+                        : m.content}
+                      {!!m.sources?.length && (
+                        <div className="mt-2 pt-2 border-t border-line-strong/40 flex flex-wrap gap-1.5">
+                          {m.sources.slice(0, 4).map((s) => (
+                            <EvidenceChip
+                              key={s.source_id}
+                              label={s.title}
+                              title={`${s.sender || ''} ${s.date || ''}`.trim()}
+                              onClick={() => onShowSource(s.source_id)}
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+            <div ref={bottomRef} />
+          </div>
+
+          <form className="shrink-0 p-3 border-t border-line"
             onSubmit={(e) => { e.preventDefault(); ask(input) }}>
-        <input value={input} onChange={(e) => setInput(e.target.value)} disabled={busy}
-               placeholder="Ask about your money…"
-               className={`flex-1 min-w-0 bg-card border border-line-strong rounded-lg px-3 py-2 text-sm text-ink placeholder:text-faint outline-none focus:border-accent ${focusRing}`} />
-        <button type="submit" disabled={busy || !input.trim()} aria-label="Send" className={btn.primary}>
-          <SendHorizonal size={15} strokeWidth={1.75} />
-        </button>
-      </form>
-      </>
+            <div className="flex items-end gap-2 bg-card border border-line-strong rounded-2xl px-2.5 py-1.5 transition-colors duration-150 focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/30">
+
+              <textarea
+                ref={inputRef}
+                rows={1}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter sends; Shift+Enter (and IME composition) inserts a newline.
+                  if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                    e.preventDefault()
+                    ask(input)
+                  }
+                }}
+                disabled={busy}
+                placeholder="Ask about your money…"
+                aria-label="Message"
+                className="flex-1 min-w-0 resize-none bg-transparent px-1.5 py-1.5 text-sm text-ink placeholder:text-faint outline-none max-h-40 leading-relaxed"
+              />
+              <button
+                type="submit"
+                disabled={busy || !input.trim()}
+                aria-label="Send"
+                className={`inline-flex items-center justify-center shrink-0 bg-ink text-white hover:bg-ink-hover w-8 h-8 rounded-xl mb-0.5 transition-colors duration-150 disabled:opacity-50 disabled:pointer-events-none cursor-pointer ${focusRing}`}
+              >
+                <SendHorizonal size={15} strokeWidth={1.75} />
+              </button>
+            </div>
+            <p className="mt-.5 px-1 text-[8px] text-faint">
+              <kbd className="font-sans">Enter</kbd> to send · <kbd className="font-sans">Shift+Enter</kbd> for a new line
+            </p>
+          </form>
+        </>
       )}
     </div>
   )
