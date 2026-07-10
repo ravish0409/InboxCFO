@@ -7,13 +7,14 @@ message; the upload path keeps working regardless.
 
 import base64
 import os
+from collections.abc import Callable, Iterator
 from datetime import date
 
 from sqlmodel import Session, select
 
 from ..config import GMAIL_CREDENTIALS_FILE, GMAIL_MAX_MESSAGES, GMAIL_TOKEN_FILE
 from ..models import Source
-from .extraction import extract_source, store_source
+from .extraction import extract_source, store_source, summarize_counts
 from .pdf import html_to_text, pdf_to_text
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -82,20 +83,52 @@ def _walk_parts(service, msg_id: str, payload: dict) -> tuple[list[str], list[st
     return plains, htmls
 
 
-def sync_inbox(session: Session, max_messages: int | None = None) -> dict:
+def sync_inbox_events(session: Session, max_messages: int | None = None,
+                      should_stop: Callable[[], bool] | None = None) -> Iterator[dict]:
+    """Sync the inbox while yielding progress events, one message at a time, so the
+    UI can narrate the agent's work live over SSE. Event shapes:
+
+      {"type": "status", "message": str}          - connection / listing progress
+      {"type": "start",  "total": int}            - number of messages to scan
+      {"type": "item",   "index", "total",        - a message the agent is now analyzing
+                         "title", "sender"}
+      {"type": "line",   "index", "file",         - result for one message (a "row")
+                         "summary", "skipped", "source_id"}
+      {"type": "done", "fetched", "new",          - final tally (same as sync_inbox())
+                       "skipped_existing", "extracted"}
+
+    The consumer is responsible for translating these into `data:` SSE frames.
+    """
+    yield {"type": "status", "message": "connecting to gmail…"}
     service = _get_service()
     limit = max_messages or GMAIL_MAX_MESSAGES
-    resp = service.users().messages().list(userId="me", maxResults=limit, q="-in:spam -in:trash").execute()
+    yield {"type": "status", "message": "listing inbox…"}
+    resp = service.users().messages().list(
+        userId="me", maxResults=limit, q="-in:spam -in:trash").execute()
     message_ids = [m["id"] for m in resp.get("messages", [])]
+    total = len(message_ids)
+    yield {"type": "start", "total": total}
 
-    new, skipped, counts_total = 0, 0, {"subscriptions": 0, "bills": 0, "transactions": 0, "documents": 0}
-    for mid in message_ids:
+    new, skipped = 0, 0
+    counts_total = {"subscriptions": 0, "bills": 0, "transactions": 0, "documents": 0}
+    for i, mid in enumerate(message_ids):
+        # Cooperative cancel: the client hit Stop (disconnected). Break before doing any
+        # more Gmail fetches or LLM extraction — whatever's already committed stays.
+        if should_stop and should_stop():
+            yield {"type": "stopped", "index": i, "total": total}
+            break
         exists = session.exec(select(Source).where(Source.external_id == mid)).first()
         if exists:
             skipped += 1
+            yield {"type": "line", "index": i, "file": exists.title or "(already on file)",
+                   "summary": "already synced, skipped", "skipped": True,
+                   "source_id": exists.id}
             continue
         full = service.users().messages().get(userId="me", id=mid, format="full").execute()
         headers = {h["name"].lower(): h["value"] for h in full.get("payload", {}).get("headers", [])}
+        title = headers.get("subject", "(no subject)")
+        sender = headers.get("from", "")
+        yield {"type": "item", "index": i, "total": total, "title": title, "sender": sender}
         plains, htmls = _walk_parts(service, mid, full.get("payload", {}))
         body = "\n".join(plains).strip() or html_to_text("\n".join(htmls))
         received: date | None = None
@@ -104,8 +137,8 @@ def sync_inbox(session: Session, max_messages: int | None = None) -> dict:
         source = store_source(
             session,
             source_type="email",
-            title=headers.get("subject", "(no subject)"),
-            sender=headers.get("from", ""),
+            title=title,
+            sender=sender,
             received_at=received,
             raw_text=body,
             external_id=mid,
@@ -114,5 +147,19 @@ def sync_inbox(session: Session, max_messages: int | None = None) -> dict:
         for k in counts_total:
             counts_total[k] += counts[k]
         new += 1
+        yield {"type": "line", "index": i, "file": title, "summary": summarize_counts(counts),
+               "skipped": False, "source_id": source.id}
 
-    return {"fetched": len(message_ids), "new": new, "skipped_existing": skipped, "extracted": counts_total}
+    yield {"type": "done", "fetched": total, "new": new,
+           "skipped_existing": skipped, "extracted": counts_total}
+
+
+def sync_inbox(session: Session, max_messages: int | None = None) -> dict:
+    """Non-streaming sync: drive the event generator to completion and return the
+    final tally. The streaming endpoint consumes `sync_inbox_events` directly."""
+    result = {"fetched": 0, "new": 0, "skipped_existing": 0,
+              "extracted": {"subscriptions": 0, "bills": 0, "transactions": 0, "documents": 0}}
+    for event in sync_inbox_events(session, max_messages):
+        if event["type"] == "done":
+            result = {k: v for k, v in event.items() if k != "type"}
+    return result

@@ -11,6 +11,7 @@ from sqlmodel import Session, select
 
 from ..models import InsightsCache, Subscription
 from .agent import find_duplicate_subscriptions, upcoming_renewals
+from .fx import to_inr
 from .llm import LLMNotConfigured, chat_json
 
 SAVINGS_SYSTEM = """You are a pragmatic personal-finance advisor. Given a JSON summary of the user's
@@ -30,7 +31,8 @@ def _compute_rule_based(session: Session):
     subs = session.exec(select(Subscription).where(Subscription.status == "active")).all()
     dupes = find_duplicate_subscriptions(session)["duplicate_groups"]
     renewals = upcoming_renewals(session, days=45)["items"]
-    total_monthly = round(sum(_monthly_cost(s) for s in subs), 2)
+    # Base currency for the headline total is INR — convert each sub before summing.
+    total_monthly = round(sum(to_inr(_monthly_cost(s), s.currency) for s in subs), 2)
     return subs, dupes, renewals, total_monthly
 
 

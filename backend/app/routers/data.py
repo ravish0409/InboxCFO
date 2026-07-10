@@ -7,6 +7,7 @@ from sqlmodel import Session, select
 from ..db import get_session
 from ..models import Bill, DocumentRecord, InsightsCache, Source, Subscription, Transaction
 from ..services.actions import _monthly
+from ..services.fx import to_inr
 from ..services.insights import build_insights, regenerate_suggestions_bg
 
 router = APIRouter(prefix="/api", tags=["data"])
@@ -36,10 +37,12 @@ def get_transactions(session: Session = Depends(get_session)):
 @router.get("/spend-by-month")
 def spend_by_month(session: Session = Depends(get_session)):
     txns = session.exec(select(Transaction)).all()
+    # Amounts may be in mixed currencies; normalise each to INR before bucketing so a
+    # month's bar isn't a nonsensical sum of e.g. dollars and rupees.
     buckets: dict[str, float] = defaultdict(float)
     for t in txns:
         if t.txn_date:
-            buckets[t.txn_date.strftime("%Y-%m")] += t.amount
+            buckets[t.txn_date.strftime("%Y-%m")] += to_inr(t.amount, t.currency)
     return [{"month": m, "total": round(v, 2)} for m, v in sorted(buckets.items())][-6:]
 
 
@@ -68,10 +71,11 @@ def get_stats(session: Session = Depends(get_session)):
     subs = session.exec(select(Subscription).where(Subscription.status == "active")).all()
     txns = session.exec(select(Transaction)).all()
     sources = session.exec(select(Source)).all()
-    monthly = sum(_monthly(s) for s in subs)
+    # Totals mix currencies, so convert every amount to INR before summing (base = INR).
+    monthly = sum(to_inr(_monthly(s), s.currency) for s in subs)
     today = date.today()
     this_month = sum(
-        t.amount for t in txns
+        to_inr(t.amount, t.currency) for t in txns
         if t.txn_date and t.txn_date.year == today.year and t.txn_date.month == today.month
     )
     return {

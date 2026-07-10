@@ -72,8 +72,14 @@ the same client handles both.
 
 1. Google Cloud Console → create project → enable **Gmail API**.
 2. OAuth consent screen → *Testing* mode → add your demo account as a test user.
-3. Credentials → **OAuth client ID (Desktop app)** → download as `backend/credentials.json`.
+3. Credentials → **OAuth client ID (Desktop app)** → download the JSON and save it as
+   `backend/credentials.json` (see `backend/credentials.example.json` for the expected shape).
+   To use a different path, set `GMAIL_CREDENTIALS_FILE` in `.env`.
 4. Click **Sync Inbox** in the app — first run opens a browser consent window and caches `token.json`.
+
+> ⚠️ **Never commit `credentials.json`, `client_secret*.json`, or `token.json`** — they hold a live
+> OAuth client secret. They're already gitignored; only `credentials.example.json` (no secret) is tracked.
+> If a secret ever leaks, rotate it in Google Cloud Console → APIs & Services → Credentials.
 
 Tip for demos: use a **seeded demo Gmail account** (send it ~30 realistic emails: streaming
 receipts, an insurance renewal, utility bills, bank UPI alerts) rather than a real inbox.

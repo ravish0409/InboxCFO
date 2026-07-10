@@ -12,6 +12,7 @@ from urllib.parse import quote
 from sqlmodel import Session, select
 
 from ..models import ActionItem, Subscription
+from .fx import to_inr
 
 HORIZON_DAYS = 7
 _SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
@@ -89,10 +90,18 @@ def _duplicate_signals(subs: list[Subscription]) -> list[dict]:
         keys = {s.norm_key or s.name.lower() for s in group}
         if cat == "other" or len(keys) < 2:
             continue
-        cheapest = min(group, key=_monthly)
-        to_cancel = max(group, key=_monthly)  # the pricier one is the cancel target
-        combined = sum(_monthly(s) for s in group)
-        saving = round(combined - _monthly(cheapest), 2)
+        # Compare on a common currency (INR) so "cheapest" is real even across currencies.
+        cheapest = min(group, key=lambda s: to_inr(_monthly(s), s.currency))
+        to_cancel = max(group, key=lambda s: to_inr(_monthly(s), s.currency))  # cancel the pricier one
+        # If the group is a single currency, keep the saving in it; otherwise report in INR.
+        currencies = {(s.currency or "INR").upper() for s in group}
+        if len(currencies) == 1:
+            saving_cur = cheapest.currency or "INR"
+            saving = round(sum(_monthly(s) for s in group) - _monthly(cheapest), 2)
+        else:
+            saving_cur = "INR"
+            combined_inr = sum(to_inr(_monthly(s), s.currency) for s in group)
+            saving = round(combined_inr - to_inr(_monthly(cheapest), cheapest.currency), 2)
         others = ", ".join(s.name for s in group if s.id != cheapest.id)
         # Order-independent key (§3A.7): the signal is identified by its category + the
         # *set* of overlapping services, so a changed group is a new signal rather than
@@ -102,9 +111,9 @@ def _duplicate_signals(subs: list[Subscription]) -> list[dict]:
             "kind": "duplicate", "dedup_key": dedup_key,
             "title": f"{len(group)} {cat} subscriptions overlap",
             "detail": f"You pay for {', '.join(s.name for s in group)}. Keep {cheapest.name} "
-                      f"and cancel {others} to save about {cheapest.currency} {saving:.0f}/mo.",
+                      f"and cancel {others} to save about {saving_cur} {saving:.0f}/mo.",
             "severity": "medium", "estimated_saving": saving,
-            "currency": cheapest.currency or "INR",
+            "currency": saving_cur,
             "subscription_id": to_cancel.id, "source_id": to_cancel.source_id,
         })
     return out

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import {
   TimerReset, RefreshCw, TrendingUp, Copy, Scissors, CircleDot,
 } from 'lucide-react'
-import { api, inr, fmtRel } from '../api'
+import { api, inr, money, toINR, fmtRel } from '../api'
 import { EvidenceChip } from './Evidence'
 import { Empty } from './Dashboard'
 import { btn } from '../ui'
@@ -35,7 +35,7 @@ export function ActionCenter({ items, onShowSource, onRefresh, onBusy }) {
 
   const open = (items || []).filter((a) => a.status !== 'dismissed')
   const pending = open.filter((a) => a.status !== 'approved')
-  const savings = pending.reduce((s, a) => s + (a.estimated_saving || 0), 0)
+  const savings = pending.reduce((s, a) => s + toINR(a.estimated_saving, a.currency), 0)
 
   async function run(id, fn, label) {
     setBusy(id)
@@ -112,7 +112,7 @@ export function ActionCenter({ items, onShowSource, onRefresh, onBusy }) {
                   <span className="text-sm font-semibold text-ink">{a.title}</span>
                   {a.estimated_saving != null && (
                     <span className="font-mono text-[11px] text-accent bg-accent-soft rounded-md px-1.5 py-0.5 whitespace-nowrap">
-                      save {inr(a.estimated_saving)}{a.kind === 'price_increase' ? '' : '/mo'}
+                      save {money(a.estimated_saving, a.currency)}{a.kind === 'price_increase' ? '' : '/mo'}
                     </span>
                   )}
                   <span className="ml-auto flex items-center gap-2 whitespace-nowrap">

@@ -7,6 +7,7 @@ __pycache__/
 backend/.env
 backend/credentials.json
 backend/token.json
+backend/client_secret*.json
 backend/data.db
 
 # Node

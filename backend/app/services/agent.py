@@ -137,26 +137,34 @@ def find_duplicate_subscriptions(session: Session) -> dict:
 
 
 def find_documents(session: Session, query: str = "") -> dict:
-    q = (query or "").lower()
+    # Score by how many query words a row matches, then rank — an OR-match ("car" OR
+    # "insurance") pulls in a car warranty *and* a home policy for "car insurance", so the
+    # cited source ends up being the wrong document. Ranking keeps the true match on top.
+    words = [w for w in (query or "").lower().split() if w]
     docs = session.exec(select(DocumentRecord)).all()
     bills = session.exec(select(Bill)).all()
-    results = []
+    scored: list[tuple[int, dict]] = []
     for d in docs:
         hay = f"{d.title} {d.provider} {d.doc_type} {d.summary}".lower()
-        if not q or any(w in hay for w in q.split()):
-            results.append({"kind": "document", "doc_type": d.doc_type, "title": d.title,
-                            "provider": d.provider,
-                            "expiry_date": d.expiry_date.isoformat() if d.expiry_date else None,
-                            "amount": d.amount, "currency": d.currency, "summary": d.summary,
-                            "source": _source_ref(session, d.source_id)})
+        score = sum(1 for w in words if w in hay)
+        if words and score == 0:  # empty query = browse all; a real query must match
+            continue
+        scored.append((score, {"kind": "document", "doc_type": d.doc_type, "title": d.title,
+                               "provider": d.provider,
+                               "expiry_date": d.expiry_date.isoformat() if d.expiry_date else None,
+                               "amount": d.amount, "currency": d.currency, "summary": d.summary,
+                               "source": _source_ref(session, d.source_id)}))
     for b in bills:
         hay = f"{b.name} {b.category}".lower()
-        if q and any(w in hay for w in q.split()):
-            results.append({"kind": "bill", "title": b.name, "category": b.category,
-                            "due_date": b.due_date.isoformat() if b.due_date else None,
-                            "amount": b.amount, "currency": b.currency, "status": b.status,
-                            "source": _source_ref(session, b.source_id)})
-    return {"results": results[:20]}
+        score = sum(1 for w in words if w in hay)
+        if not words or score == 0:  # never dump every bill for an empty/relevance-less query
+            continue
+        scored.append((score, {"kind": "bill", "title": b.name, "category": b.category,
+                               "due_date": b.due_date.isoformat() if b.due_date else None,
+                               "amount": b.amount, "currency": b.currency, "status": b.status,
+                               "source": _source_ref(session, b.source_id)}))
+    scored.sort(key=lambda x: x[0], reverse=True)  # stable: ties keep DB order
+    return {"results": [r for _, r in scored[:20]]}
 
 
 def list_action_items(session: Session) -> dict:
@@ -277,7 +285,9 @@ TOOL_SCHEMAS = [
 SYSTEM_PROMPT = """You are "Inbox CFO", a personal finance assistant. You answer questions about the user's
 subscriptions, bills, transactions, insurance and documents using ONLY the provided tools — never guess numbers.
 
-Today's date is {today}. Default currency is INR (₹).
+Today's date is {today}. Default currency is INR (₹), but every tool result carries a per-item
+`currency` code — format each amount with the symbol for ITS OWN currency (₹ INR, $ USD, € EUR,
+£ GBP, ¥ JPY). Only fall back to ₹ when a currency is missing. Never relabel a non-INR amount as rupees.
 
 Rules:
 - Always call a tool before answering a factual question. For spend questions use total_spend (overall),
@@ -346,17 +356,37 @@ def _tool_response_part(name: str, result: dict) -> "types.Part":
     return types.Part.from_function_response(name=name, response=safe)
 
 
-def _collect_sources(obj, acc: list[dict]) -> None:
+def _collect_sources(obj, acc: list[tuple[float, dict]]) -> None:
+    """Walk a tool result and pull every {source: {...}} out, tagging each with the row's own
+    magnitude (amount / saving / combined cost) as a relevance weight. We rank by that weight so
+    the handful of chips the UI shows are the biggest contributors to the answer — not just the
+    first rows we happened to walk."""
     if isinstance(obj, dict):
         src = obj.get("source")
         if isinstance(src, dict) and src.get("source_id") is not None:
-            if src not in acc:
-                acc.append(src)
+            weight = (obj.get("amount") or obj.get("estimated_saving")
+                      or obj.get("combined_monthly_cost") or 0)
+            acc.append((abs(weight or 0), src))
         for v in obj.values():
             _collect_sources(v, acc)
     elif isinstance(obj, list):
         for v in obj:
             _collect_sources(v, acc)
+
+
+def _rank_sources(weighted: list[tuple[float, dict]]) -> list[dict]:
+    """Dedup by source_id (keeping its heaviest occurrence) and order heaviest-first."""
+    best: dict[int, list] = {}
+    order: list[int] = []
+    for weight, src in weighted:
+        sid = src["source_id"]
+        if sid not in best:
+            best[sid] = [weight, src]
+            order.append(sid)
+        elif weight > best[sid][0]:
+            best[sid][0] = weight
+    order.sort(key=lambda sid: best[sid][0], reverse=True)  # stable: ties keep first-seen order
+    return [best[sid][1] for sid in order]
 
 
 def _run_tool(session: Session, name: str, args: dict) -> dict:
@@ -386,12 +416,15 @@ def answer_question(session: Session, question: str, history: list[dict] | None 
 
         contents.append(resp.candidates[0].content)  # the model's function-call turn
         response_parts = []
+        turn_acc: list[tuple[float, dict]] = []  # only this turn's sources back the answer
         for fc in calls:
             args = dict(fc.args or {})
             result = _run_tool(session, fc.name, args)
-            _collect_sources(result, sources)
+            _collect_sources(result, turn_acc)
             trace.append({"tool": fc.name, "args": args})
             response_parts.append(_tool_response_part(fc.name, result))
+        if turn_acc:  # keep the latest data-bearing turn; exploratory earlier calls don't cite
+            sources = _rank_sources(turn_acc)
         contents.append(types.Content(role="user", parts=response_parts))
 
     return {"answer": "I couldn't complete that within my step limit — try a simpler question.",
@@ -441,11 +474,14 @@ def stream_answer(session: Session, question: str, history: list[dict] | None = 
         contents.append(types.Content(role="model", parts=model_parts))
 
         response_parts = []
+        turn_acc: list[tuple[float, dict]] = []  # only this turn's sources back the answer
         for name, args in exec_calls:
             yield {"type": "tool", "tool": name}
             result = _run_tool(session, name, args)
-            _collect_sources(result, sources)
+            _collect_sources(result, turn_acc)
             response_parts.append(_tool_response_part(name, result))
+        if turn_acc:  # keep the latest data-bearing turn; exploratory earlier calls don't cite
+            sources = _rank_sources(turn_acc)
         contents.append(types.Content(role="user", parts=response_parts))
 
     yield {"type": "token",

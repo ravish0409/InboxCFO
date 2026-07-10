@@ -5,7 +5,7 @@ import {
   ChevronRight, Clapperboard, Cloud, CircleDot, Dumbbell, Lightbulb, Music,
   Newspaper, ShoppingBag, Zap,
 } from 'lucide-react'
-import { inr, fmtTime } from '../api'
+import { inr, money, toINR, fmtTime } from '../api'
 import { EvidenceChip } from './Evidence'
 import { focusRing } from '../ui'
 
@@ -46,7 +46,7 @@ export function Empty({ msg }) {
 // ── Overview ────────────────────────────────────────────────────────────────
 
 export function KpiGrid({ stats, pending, onGotoApprovals }) {
-  const savings = pending.reduce((s, a) => s + (a.estimated_saving || 0), 0)
+  const savings = pending.reduce((s, a) => s + toINR(a.estimated_saving, a.currency), 0)
   const kpis = [
     {
       label: 'Recurring / month',
@@ -145,7 +145,7 @@ export function RenewalsCard({ insights, onShowSource }) {
                     {d != null ? (d <= 0 ? 'due today' : `in ${d} day${d === 1 ? '' : 's'}`) : r.date}
                   </div>
                 </div>
-                <span className="font-mono text-sm tabular-nums text-ink whitespace-nowrap">{inr(r.amount)}</span>
+                <span className="font-mono text-sm tabular-nums text-ink whitespace-nowrap">{money(r.amount, r.currency)}</span>
                 {r.source?.source_id && <EvidenceChip onClick={() => onShowSource(r.source.source_id)} />}
               </li>
             )
@@ -185,7 +185,7 @@ export function ApprovalsPreview({ items, onGoto }) {
                 <span className="text-sm text-dim truncate hidden sm:block flex-1 min-w-0">{a.detail}</span>
                 {a.estimated_saving != null && (
                   <span className="font-mono text-xs text-gain whitespace-nowrap ml-auto sm:ml-0">
-                    save {inr(a.estimated_saving)}/mo
+                    save {money(a.estimated_saving, a.currency)}/mo
                   </span>
                 )}
                 <ChevronRight size={14} strokeWidth={1.75} className="text-faint shrink-0" />
@@ -221,7 +221,7 @@ export function InsightsGrid({ insights }) {
               </div>
               {s.estimated_monthly_saving != null && (
                 <span className="font-mono text-[11px] text-accent bg-accent-soft rounded-md px-1.5 py-0.5 whitespace-nowrap">
-                  {inr(s.estimated_monthly_saving)}/mo
+                  {money(s.estimated_monthly_saving, s.currency)}/mo
                 </span>
               )}
             </div>
@@ -276,9 +276,9 @@ export function SubscriptionsTable({ subscriptions, stats, onShowSource }) {
                   <td className="px-4 py-3 text-dim hidden sm:table-cell">{cycleLabel(s.billing_cycle)}</td>
                   <td className="px-4 py-3 font-mono text-xs text-dim hidden md:table-cell">{s.next_renewal || '—'}</td>
                   <td className="px-4 py-3 text-right whitespace-nowrap">
-                    <span className="font-mono tabular-nums text-ink">{inr(s.amount)}</span>
+                    <span className="font-mono tabular-nums text-ink">{money(s.amount, s.currency)}</span>
                     {hiked && (
-                      <div className="font-mono text-[11px] text-alert">↑ from {inr(s.previous_amount)}</div>
+                      <div className="font-mono text-[11px] text-alert">↑ from {money(s.previous_amount, s.currency)}</div>
                     )}
                   </td>
                   <td className="px-4 py-3 text-right">

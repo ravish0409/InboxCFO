@@ -264,6 +264,29 @@ def extract_source(session: Session, source: Source) -> dict:
     return counts
 
 
+_COUNT_LABELS = (
+    ("subscriptions", "subscription", "subscriptions"),
+    ("bills", "bill", "bills"),
+    ("transactions", "transaction", "transactions"),
+    ("documents", "document", "documents"),
+)
+
+
+def summarize_counts(counts: dict) -> str:
+    """Human line for one processed source, e.g. "1 subscription · 2 transactions".
+    Includes updated (not just new) subscriptions so a renewal email doesn't read
+    as "no new records"."""
+    parts = [
+        f"{counts[key]} {one if counts[key] == 1 else many}"
+        for key, one, many in _COUNT_LABELS
+        if counts.get(key)
+    ]
+    updated = counts.get("subscriptions_updated", 0)
+    if updated:
+        parts.append(f"{updated} updated")
+    return " · ".join(parts) or "no new records"
+
+
 def find_source_by_hash(session: Session, digest: str) -> Source | None:
     """Return an already-ingested source with this content fingerprint, if any."""
     if not digest:

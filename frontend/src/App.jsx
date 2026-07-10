@@ -29,6 +29,52 @@ function summarizeExtracted(extracted) {
 
 const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`
 
+// Fold one live SSE progress event into the agent-activity job. Events stream in
+// from /api/sync/stream and /api/upload/stream as the agent reads each message.
+function reduceJobEvent(job, ev) {
+  switch (ev.type) {
+    case 'status': // connecting / listing — a transient activity label
+      return { ...job, startLabel: ev.message }
+    case 'start':
+      return {
+        ...job,
+        progress: { current: 0, total: ev.total },
+        startLabel: ev.total ? `found ${plural(ev.total, 'item', 'items')}…` : 'nothing new to read',
+      }
+    case 'item': // the agent is now analyzing this message
+      return {
+        ...job,
+        startLabel: `analyzing ${ev.title}…`,
+        progress: { current: ev.index + 1, total: ev.total },
+      }
+    case 'line': // a finished row — append it live
+      return {
+        ...job,
+        lines: [
+          ...(job.lines || []),
+          {
+            file: ev.file,
+            summary: ev.summary ?? summarizeExtracted(ev.extracted),
+            skipped: ev.skipped,
+            source_id: ev.source_id,
+            error: ev.error,
+          },
+        ],
+      }
+    case 'done':
+      return {
+        ...job,
+        running: false,
+        progress: null,
+        summary: `filed ${plural(ev.new, 'new item', 'new items')} · re-checking traps…`,
+      }
+    case 'error':
+      return { ...job, running: false, progress: null, error: ev.message }
+    default: // 'close' and anything unknown — no state change
+      return job
+  }
+}
+
 export default function App() {
   const [stats, setStats] = useState(null)
   const [subscriptions, setSubscriptions] = useState([])
@@ -48,6 +94,7 @@ export default function App() {
   )
   const fileRef = useRef(null)
   const jobCounter = useRef(0)
+  const jobAbort = useRef(null)   // AbortController for the in-flight sync/upload stream
 
   const refresh = useCallback(async () => {
     const [st, subs, sp, ins, act] = await Promise.allSettled([
@@ -67,26 +114,39 @@ export default function App() {
     window.history.replaceState(null, '', `#${view}`)
   }, [view])
 
+  // Apply a live event to the job, but only if it still belongs to the current run —
+  // a newer sync/upload started meanwhile invalidates older events.
+  const applyJobEvent = useCallback((id, ev) => {
+    setJob((prev) => (prev && prev.id === id ? reduceJobEvent(prev, ev) : prev))
+  }, [])
+
+  // Stop the running sync/upload: abort the stream. The stream promise then resolves,
+  // and the handler below detects the aborted signal to mark the job as stopped.
+  function handleStopJob() {
+    jobAbort.current?.abort()
+  }
+
   async function handleSync() {
     const id = ++jobCounter.current
+    const ctrl = new AbortController()
+    jobAbort.current = ctrl
     setBusy('reading inbox…')
-    setJob({ id, running: true, startLabel: 'checking inbox…' })
+    setJob({ id, running: true, startLabel: 'checking inbox…', lines: [], progress: null })
     try {
-      const res = await api.sync()
-      setJob({
-        id, running: false,
-        lines: [{
-          file: 'gmail inbox',
-          summary: `${plural(res.new, 'new item', 'new items')} · ${res.skipped_existing} already on file`,
-          skipped: res.new === 0,
-        }],
-        summary: `filed ${plural(res.new, 'new item', 'new items')} · re-checking traps…`,
-      })
+      await api.syncStream((ev) => applyJobEvent(id, ev), ctrl.signal)
+      // Stream closed — either cleanly (a `done`/`error` event already set running:false)
+      // or because the user hit Stop (aborted signal). Guard against a stream that ends
+      // without a terminal event, and label a user-initiated stop.
+      setJob((prev) => (prev && prev.id === id
+        ? { ...prev, running: false, ...(ctrl.signal.aborted ? { progress: null, startLabel: null, summary: 'stopped' } : {}) }
+        : prev))
       setLastSync(new Date())
       await refresh()
     } catch (e) {
-      setJob({ id, running: false, error: `sync failed — ${e.message}` })
+      setJob((prev) => (prev && prev.id === id
+        ? { ...prev, running: false, error: `sync failed — ${e.message}` } : prev))
     } finally {
+      if (jobAbort.current === ctrl) jobAbort.current = null
       setBusy(null)
     }
   }
@@ -96,25 +156,25 @@ export default function App() {
     e.target.value = ''
     if (!files.length) return
     const id = ++jobCounter.current
+    const ctrl = new AbortController()
+    jobAbort.current = ctrl
     setBusy('reading files…')
-    setJob({ id, running: true, startLabel: `reading ${plural(files.length, 'file', 'files')}…` })
+    setJob({
+      id, running: true, lines: [], progress: null,
+      startLabel: `reading ${plural(files.length, 'file', 'files')}…`,
+    })
     try {
-      const res = await api.upload(files)
-      const lines = res.results.map((r) => (
-        r.duplicate
-          ? { file: r.file, skipped: true, summary: 'already on file, skipped', source_id: r.source_id }
-          : { file: r.file, summary: summarizeExtracted(r.extracted), source_id: r.source_id }
-      ))
-      const newCount = res.results.filter((r) => !r.duplicate).length
-      setJob({
-        id, running: false, lines,
-        summary: `filed ${plural(newCount, 'new item', 'new items')} · re-checking traps…`,
-      })
+      await api.uploadStream(files, (ev) => applyJobEvent(id, ev), ctrl.signal)
+      setJob((prev) => (prev && prev.id === id
+        ? { ...prev, running: false, ...(ctrl.signal.aborted ? { progress: null, startLabel: null, summary: 'stopped' } : {}) }
+        : prev))
       setLastSync(new Date())
       await refresh()
     } catch (e2) {
-      setJob({ id, running: false, error: `upload failed — ${e2.message}` })
+      setJob((prev) => (prev && prev.id === id
+        ? { ...prev, running: false, error: `upload failed — ${e2.message}` } : prev))
     } finally {
+      if (jobAbort.current === ctrl) jobAbort.current = null
       setBusy(null)
     }
   }
@@ -196,7 +256,7 @@ export default function App() {
         </>
       )}
 
-      <AgentLog job={job} onShowSource={setSourceId} onDismiss={() => setJob(null)} />
+      <AgentLog job={job} onShowSource={setSourceId} onStop={handleStopJob} onDismiss={() => setJob(null)} />
       <EvidenceDrawer sourceId={sourceId} onClose={() => setSourceId(null)} />
     </div>
   )
