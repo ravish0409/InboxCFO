@@ -1,14 +1,44 @@
 @import "tailwindcss";
 
-:root {
-  color-scheme: dark;
+@theme {
+  /* Surfaces — warm paper neutrals */
+  --color-bg: #F7F6F3;          /* page background */
+  --color-card: #FFFFFF;        /* cards, panels, sidebar */
+  --color-inset: #F1EFEA;       /* nested surfaces, hovers, assistant bubbles */
+  --color-line: #E8E6E0;        /* hairline borders */
+  --color-line-strong: #D9D6CE; /* button borders, dividers that must read */
+
+  /* Text */
+  --color-ink: #23221D;         /* primary text, primary buttons */
+  --color-ink-hover: #3B3931;   /* primary button hover */
+  --color-dim: #636057;         /* secondary text */
+  --color-faint: #8E8A80;       /* labels, timestamps */
+
+  /* Brand — money green. Links, active states, agent tokens, savings */
+  --color-accent: #1B6B4C;
+  --color-accent-soft: #E7F1EB;
+  --color-gain: #177347;
+
+  /* Semantics */
+  --color-alert: #BE4437;
+  --color-alert-soft: #FAECEA;
+  --color-warn: #9C6D12;
+  --color-warn-soft: #F7EFDC;
+
+  /* Type */
+  --font-sans: "IBM Plex Sans", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
 }
 
-body {
-  @apply bg-slate-950 text-slate-200 antialiased;
-  font-family: 'Segoe UI', system-ui, sans-serif;
-}
+:root { color-scheme: light; }
+
+body { @apply bg-bg text-ink antialiased; }
 
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-thumb { @apply bg-slate-700 rounded; }
+::-webkit-scrollbar-thumb { @apply bg-line-strong rounded; }
 ::-webkit-scrollbar-track { @apply bg-transparent; }
+
+@keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: no-preference) {
+  .fade-in { animation: fadein 150ms ease-out; }
+}

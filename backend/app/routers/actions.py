@@ -8,7 +8,7 @@ from ..services.actions import (
     refresh_action_items,
     set_status,
 )
-from ..services.llm import LLMNotConfigured
+from ..services.llm import LLMNotConfigured, LLMUpstreamError
 
 router = APIRouter(prefix="/api", tags=["actions"])
 
@@ -29,6 +29,8 @@ def draft_action(action_id: int, session: Session = Depends(get_session)):
         result = draft_cancellation(session, action_id)
     except LLMNotConfigured as e:
         raise HTTPException(503, str(e))
+    except LLMUpstreamError as e:
+        raise HTTPException(e.status_code, str(e))
     if "error" in result:
         raise HTTPException(404, result["error"])
     return result

@@ -7,7 +7,7 @@ from ..db import get_session
 from ..services.actions import refresh_action_items
 from ..services.extraction import extract_source, find_source_by_hash, store_source
 from ..services.gmail_sync import GmailNotConfigured, sync_inbox
-from ..services.llm import LLMNotConfigured
+from ..services.llm import LLMNotConfigured, LLMUpstreamError
 from ..services.normalize import content_hash
 from ..services.pdf import parse_eml, pdf_to_text
 
@@ -54,6 +54,8 @@ async def upload_files(files: list[UploadFile], session: Session = Depends(get_s
             results.append({"file": f.filename, "source_id": source.id, "extracted": counts})
         except LLMNotConfigured as e:
             raise HTTPException(503, str(e))
+        except LLMUpstreamError as e:
+            raise HTTPException(e.status_code, str(e))
     refresh_action_items(session)  # surface new trials/renewals/price hikes immediately
     return {"results": results}
 
@@ -68,3 +70,5 @@ def sync_gmail(max_messages: int | None = None, session: Session = Depends(get_s
         raise HTTPException(503, str(e))
     except LLMNotConfigured as e:
         raise HTTPException(503, str(e))
+    except LLMUpstreamError as e:
+        raise HTTPException(e.status_code, str(e))

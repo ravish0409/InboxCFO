@@ -5,14 +5,88 @@ Gemini exposes an OpenAI-compatible endpoint, so the same client and calls work 
 """
 
 import json
+import re
+import time
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    RateLimitError,
+)
 
 from ..config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
 
 
 class LLMNotConfigured(Exception):
     pass
+
+
+class LLMUpstreamError(Exception):
+    """The LLM provider was reachable but returned an error (rate limit, auth,
+    timeout, outage). Carries an HTTP `status_code` so routers can surface a
+    clean, actionable response instead of a bare 500."""
+
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+# Gemini free tier caps requests *per minute*, so the agent's burst of tool-calling
+# turns routinely trips a 429 that clears within seconds. Retry those here; only a
+# limit that persists across all retries (e.g. the daily cap) reaches the user.
+_RATE_LIMIT_RETRIES = 2
+_MAX_RETRY_SLEEP = 30.0
+
+
+def _retry_delay(e: RateLimitError, attempt: int) -> float:
+    """Seconds to wait before retrying a 429. Gemini includes a RetryInfo delay
+    (e.g. 'retryDelay': '7s') in the error body; fall back to exponential backoff."""
+    m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+)", str(e))
+    delay = float(m.group(1)) if m else 5.0 * (attempt + 1)
+    return min(delay, _MAX_RETRY_SLEEP)
+
+
+def _complete(client: "OpenAI", **kwargs):
+    """Run a chat completion, translating provider SDK errors into LLMUpstreamError.
+
+    Without this, an upstream 429/5xx bubbles up as an uncaught exception and the
+    API returns an opaque 500 ("Couldn't reach the agent") — misleading, since the
+    backend is fine and the provider is the one refusing the call.
+    """
+    try:
+        for attempt in range(_RATE_LIMIT_RETRIES + 1):
+            try:
+                return client.chat.completions.create(**kwargs)
+            except RateLimitError as e:
+                if attempt == _RATE_LIMIT_RETRIES:
+                    raise
+                time.sleep(_retry_delay(e, attempt))
+    except RateLimitError as e:
+        raise LLMUpstreamError(
+            f"{LLM_PROVIDER} is rate-limited (429) and retrying didn't clear it. "
+            "Per-minute limits usually reset within a minute — try again shortly. "
+            "If it persists, the daily free-tier quota may be exhausted: wait, "
+            "switch LLM_PROVIDER, or use a paid key.",
+            429,
+        ) from e
+    except APITimeoutError as e:
+        raise LLMUpstreamError(f"{LLM_PROVIDER} timed out. Try again.", 504) from e
+    except APIConnectionError as e:
+        raise LLMUpstreamError(
+            f"Couldn't reach {LLM_PROVIDER}. Check the network and LLM_BASE_URL.", 502
+        ) from e
+    except APIStatusError as e:
+        # Auth (401/403) and other provider-side status errors.
+        raise LLMUpstreamError(
+            f"{LLM_PROVIDER} returned an error ({e.status_code}). "
+            "Check the API key and model name.",
+            502 if e.status_code >= 500 else e.status_code,
+        ) from e
+    except APIError as e:
+        raise LLMUpstreamError(f"{LLM_PROVIDER} call failed: {e}", 502) from e
 
 
 _client: OpenAI | None = None
@@ -47,7 +121,8 @@ def chat_json(
     client = get_client()
     last_error: Exception | None = None
     for attempt in range(retries + 1):
-        resp = client.chat.completions.create(
+        resp = _complete(
+            client,
             model=LLM_MODEL,
             temperature=temperature,
             response_format={"type": "json_object"},
@@ -74,7 +149,8 @@ def chat_json(
 def chat_text(system: str, user: str, temperature: float = 0.3) -> str:
     """One-shot completion returning free-form text (e.g. a drafted email)."""
     client = get_client()
-    resp = client.chat.completions.create(
+    resp = _complete(
+        client,
         model=LLM_MODEL,
         temperature=temperature,
         messages=[
@@ -95,7 +171,7 @@ def chat_raw(messages: list[dict], tools: list[dict] | None = None, temperature:
     }
     if tools:
         kwargs["tools"] = tools
-    return client.chat.completions.create(**kwargs)
+    return _complete(client, **kwargs)
 
 
 def _parse_json_lenient(text: str) -> dict:

@@ -4,7 +4,7 @@ from sqlmodel import Session
 
 from ..db import get_session
 from ..services.agent import answer_question
-from ..services.llm import LLMNotConfigured
+from ..services.llm import LLMNotConfigured, LLMUpstreamError
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -22,3 +22,5 @@ def chat(req: ChatRequest, session: Session = Depends(get_session)):
         return answer_question(session, req.question.strip(), req.history)
     except LLMNotConfigured as e:
         raise HTTPException(503, str(e))
+    except LLMUpstreamError as e:
+        raise HTTPException(e.status_code, str(e))
