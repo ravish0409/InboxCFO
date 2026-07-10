@@ -47,6 +47,11 @@ else:
 
 AGENT_TOOL_MODE = os.getenv("AGENT_TOOL_MODE", "native").lower()
 
+# Client-side request pacing: cap outgoing LLM calls to stay under the provider's
+# per-minute request limit (free-tier Gemini models are as low as 5-15 RPM). Set this a
+# little BELOW your model's RPM (gemini-3.1-flash-lite = 15 -> 14). 0 disables pacing.
+LLM_MAX_RPM = int(os.getenv("LLM_MAX_RPM", "14"))
+
 GMAIL_CREDENTIALS_FILE = str(BACKEND_DIR / os.getenv("GMAIL_CREDENTIALS_FILE", "credentials.json"))
 GMAIL_TOKEN_FILE = str(BACKEND_DIR / os.getenv("GMAIL_TOKEN_FILE", "token.json"))
 GMAIL_MAX_MESSAGES = int(os.getenv("GMAIL_MAX_MESSAGES", "40"))

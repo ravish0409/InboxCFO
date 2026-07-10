@@ -4,7 +4,8 @@ The chat agent never sees raw emails — it queries these tables. Extracting onc
 ingest time is what makes spend questions return correct SQL sums, not LLM guesses.
 """
 
-from datetime import date, datetime
+import calendar
+from datetime import date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 
 from sqlmodel import Session, select
@@ -101,11 +102,89 @@ def _num(value) -> float | None:
         return None
 
 
+def _add_months(d: date, months: int) -> date:
+    """Add whole months to a date, clamping the day to the target month's length
+    (Jan 31 + 1 month -> Feb 28/29)."""
+    m = d.month - 1 + months
+    year, month = d.year + m // 12, m % 12 + 1
+    last = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last))
+
+
+def _advance_renewal(d: date | None, cycle: str, today: date) -> date | None:
+    """Roll a past renewal date forward by whole billing cycles until it is >= today,
+    so a lapsed date doesn't silently drop out of renewal alerts. A future/null date is
+    returned unchanged. Guarded against runaway loops on absurd inputs."""
+    if d is None or d >= today:
+        return d
+    for _ in range(1200):
+        if cycle == "weekly":
+            d = d + timedelta(days=7)
+        elif cycle == "yearly":
+            d = _add_months(d, 12)
+        else:  # monthly (default)
+            d = _add_months(d, 1)
+        if d >= today:
+            break
+    return d
+
+
+def _charge_date(next_renewal: date | None, cycle: str, fallback: date) -> date:
+    """Best estimate of the date THIS invoice's charge occurred: one billing cycle before
+    the next renewal (the current period's start). Uploads stamp `received_at` with the
+    upload date, so the invoice's own renewal date — not `received_at` — is the reliable
+    anchor. Falls back to `fallback` when no renewal date is known."""
+    if next_renewal is None:
+        return fallback
+    if cycle == "weekly":
+        return next_renewal - timedelta(days=7)
+    if cycle == "yearly":
+        return _add_months(next_renewal, -12)
+    return _add_months(next_renewal, -1)
+
+
+def _txn_dedup_key(merchant: str, txn_date: date | None, amount: float, currency: str) -> str:
+    """merchant|date|amount|currency fingerprint so the same charge isn't counted twice."""
+    d = txn_date.isoformat() if txn_date else ""
+    return f"{norm_key(merchant)}|{d}|{amount:.2f}|{(currency or 'INR').upper()}"
+
+
+def _add_transaction(session: Session, source: Source, *, merchant: str, amount: float,
+                     currency: str, category, description: str, txn_date: date | None,
+                     counts: dict) -> None:
+    """Insert a transaction unless an identical one (by dedup_key) already exists. This is
+    the single path for BOTH LLM-emitted charges and subscription-derived payments, so a
+    re-ingest or a charge seen twice never double-counts."""
+    if amount is None or not merchant:
+        return
+    key = _txn_dedup_key(merchant, txn_date, amount, currency)
+    session.flush()  # make prior inserts in this batch visible to the dedup query
+    if session.exec(select(Transaction).where(Transaction.dedup_key == key)).first():
+        return
+    session.add(Transaction(
+        source_id=source.id,
+        merchant=str(merchant).strip(),
+        category=coerce(category, TRANSACTION_CATEGORIES),
+        amount=amount,
+        currency=currency or "INR",
+        txn_date=txn_date,
+        description=description or "",
+        dedup_key=key,
+    ))
+    counts["transactions"] += 1
+
+
+def _bill_period(due: date | None):
+    """Coarse billing period for recurring-bill rollup — (year, month), or None."""
+    return (due.year, due.month) if due else None
+
+
 def _upsert_subscription(session: Session, source: Source, s: dict, counts: dict) -> None:
     """A recurring service (monthly Netflix email) updates its existing row rather
     than inserting a new one each cycle — otherwise duplicate-detection and the
     total-monthly-cost sum are meaningless."""
     key = norm_key(s.get("name"))
+    name = str(s["name"]).strip()
     existing = None
     if key:
         existing = session.exec(
@@ -114,50 +193,103 @@ def _upsert_subscription(session: Session, source: Source, s: dict, counts: dict
             )
         ).first()
     amount = _num(s.get("amount"))
+    currency = s.get("currency") or "INR"
     next_renewal = _parse_date(s.get("next_renewal"))
     is_trial = bool(s.get("is_trial"))
     trial_end = _parse_date(s.get("trial_end_date"))
     cancel_url = (s.get("cancel_url") or "").strip()
     auto_renews = s.get("auto_renews")
+    billing_cycle = s.get("billing_cycle") or (existing.billing_cycle if existing else "monthly")
+    today = date.today()
+    incoming_at = source.received_at or today
+
     if existing:
-        # Keep the freshest signal from the newer source; don't overwrite good data with null.
-        if amount is not None:
-            # A price change is exactly the signal a bank feed can't see until after the charge.
-            if existing.amount is not None and amount != existing.amount:
-                existing.previous_amount = existing.amount
-                existing.price_change_at = source.received_at or date.today()
-            existing.amount = amount
-        if next_renewal is not None:
-            existing.next_renewal = next_renewal
-        if trial_end is not None:
-            existing.trial_end_date = trial_end
-        if is_trial:
-            existing.is_trial = True
-        if cancel_url:
-            existing.cancel_url = cancel_url
-        if auto_renews is not None:
-            existing.auto_renews = bool(auto_renews)
-        existing.category = coerce(s.get("category"), SUBSCRIPTION_CATEGORIES)
-        existing.billing_cycle = s.get("billing_cycle") or existing.billing_cycle
-        existing.source_id = source.id
-        session.add(existing)
-        counts["subscriptions_updated"] += 1
+        # An invoice OLDER than the one that last advanced this row must not regress the
+        # renewal date or fake a price change — record its charge as history only. Prefer
+        # the invoice's own renewal date (reliable for uploads, whose received_at is just
+        # the upload day); fall back to received_at for documents with no renewal date.
+        if next_renewal is not None and existing.next_renewal is not None:
+            is_stale = next_renewal < existing.next_renewal
+        else:
+            is_stale = existing.last_invoice_at is not None and incoming_at < existing.last_invoice_at
+        if is_stale:
+            counts["stale_invoices"] += 1
+            counts["notes"].append(
+                f"{existing.name}: looks like an older invoice — recorded as historical, renewal unchanged"
+            )
+        else:
+            # Keep the freshest signal from the newer source; don't overwrite good data with null.
+            if amount is not None:
+                same_currency = (existing.currency or "INR").upper() == currency.upper()
+                # Only a real INCREASE in the SAME currency is a price hike. A currency switch
+                # updates the amount but is never flagged as a change (comparison is meaningless).
+                if existing.amount is not None and same_currency and amount > existing.amount:
+                    existing.previous_amount = existing.amount
+                    existing.price_change_at = incoming_at
+                existing.amount = amount
+                existing.currency = currency
+            # Roll forward only — never regress the renewal to an earlier date.
+            if next_renewal is not None and (
+                existing.next_renewal is None or next_renewal >= existing.next_renewal
+            ):
+                existing.next_renewal = _advance_renewal(next_renewal, billing_cycle, today)
+            if trial_end is not None:
+                existing.trial_end_date = trial_end
+            if is_trial:
+                existing.is_trial = True
+            if cancel_url:
+                existing.cancel_url = cancel_url
+            if auto_renews is not None:
+                existing.auto_renews = bool(auto_renews)
+            existing.category = coerce(s.get("category"), SUBSCRIPTION_CATEGORIES)
+            existing.billing_cycle = billing_cycle
+            existing.last_invoice_at = incoming_at
+            existing.source_id = source.id
+            session.add(existing)
+            counts["subscriptions_updated"] += 1
     else:
         session.add(Subscription(
             source_id=source.id,
-            name=str(s["name"]).strip(),
+            name=name,
             norm_key=key,
             category=coerce(s.get("category"), SUBSCRIPTION_CATEGORIES),
             amount=amount,
-            currency=s.get("currency") or "INR",
-            billing_cycle=s.get("billing_cycle") or "monthly",
-            next_renewal=next_renewal,
+            currency=currency,
+            billing_cycle=billing_cycle,
+            next_renewal=_advance_renewal(next_renewal, billing_cycle, today),
             is_trial=is_trial,
             trial_end_date=trial_end,
             cancel_url=cancel_url,
             auto_renews=bool(auto_renews) if auto_renews is not None else True,
+            last_invoice_at=incoming_at,
         ))
         counts["subscriptions"] += 1
+
+    # Derive the payment as an idempotent transaction so an invoice contributes to spend
+    # even when the LLM didn't emit one. Skip trials (no charge yet). If the LLM already
+    # recorded a same-amount charge for THIS source (usually under a different merchant
+    # string / date), don't derive a duplicate. The charge is dated to the invoice's own
+    # period — NOT the upload day — so it lands in the right month and doesn't collide with
+    # a sibling invoice's derived charge.
+    if amount is not None and not is_trial:
+        session.flush()
+        same_source = session.exec(
+            select(Transaction).where(
+                Transaction.source_id == source.id,
+                Transaction.currency == currency,
+            )
+        ).all()
+        if not any(abs((t.amount or 0) - amount) < 0.01 for t in same_source):
+            _add_transaction(
+                session, source,
+                merchant=name,
+                amount=amount,
+                currency=currency,
+                category="bills",
+                description=f"{name} {billing_cycle} charge",
+                txn_date=_charge_date(next_renewal, billing_cycle, incoming_at),
+                counts=counts,
+            )
 
 
 def extract_source(session: Session, source: Source) -> dict:
@@ -176,7 +308,25 @@ def extract_source(session: Session, source: Source) -> dict:
     counts = {
         "subscriptions": 0, "subscriptions_updated": 0,
         "bills": 0, "transactions": 0, "documents": 0,
+        "stale_invoices": 0, "notes": [],
     }
+
+    # Transactions first: subscription-derived payments (below) dedup against these, so an
+    # invoice that the LLM already recorded as a charge isn't counted twice.
+    for t in data.get("transactions") or []:
+        amount = _num(t.get("amount"))
+        if not t.get("merchant") or amount is None:
+            continue
+        _add_transaction(
+            session, source,
+            merchant=str(t["merchant"]).strip(),
+            amount=amount,
+            currency=t.get("currency") or "INR",
+            category=t.get("category"),
+            description=t.get("description") or "",
+            txn_date=_parse_date(t.get("txn_date")) or source.received_at,
+            counts=counts,
+        )
 
     for s in data.get("subscriptions") or []:
         if not s.get("name"):
@@ -186,46 +336,56 @@ def extract_source(session: Session, source: Source) -> dict:
     for b in data.get("bills") or []:
         if not b.get("name"):
             continue
-        due = _parse_date(b.get("due_date"))
+        name = str(b["name"]).strip()
         key = norm_key(b.get("name"))
-        # A bill for the same provider + same due date is the same obligation.
+        due = _parse_date(b.get("due_date"))
+        amount = _num(b.get("amount"))
+        currency = b.get("currency") or "INR"
+        category = coerce(b.get("category"), BILL_CATEGORIES, default="utility")
+        status = b.get("status") or "due"
+        period = _bill_period(due)
+
+        # Recurring-bill rollup: find the current outstanding (due) bill for this provider.
+        # Consecutive invoices supersede the prior period rather than piling up duplicates.
         existing = session.exec(
-            select(Bill).where(Bill.name == str(b["name"]).strip(), Bill.due_date == due)
+            select(Bill).where(Bill.norm_key == key, Bill.status == "due")
         ).first() if key else None
         if existing:
-            if _num(b.get("amount")) is not None:
-                existing.amount = _num(b.get("amount"))
-            existing.status = b.get("status") or existing.status
-            existing.source_id = source.id
+            ex_period = _bill_period(existing.due_date)
+            if period is not None and ex_period == period:
+                # Same period restated -> update in place.
+                if amount is not None:
+                    existing.amount = amount
+                existing.status = status
+                existing.currency = currency
+                existing.source_id = source.id
+                session.add(existing)
+                continue
+            if period is not None and ex_period is not None and period < ex_period:
+                # Older than the outstanding bill -> historical only; never resurrect a due.
+                counts["stale_invoices"] += 1
+                counts["notes"].append(f"{name}: older bill — recorded as paid history")
+                session.add(Bill(
+                    source_id=source.id, name=name, norm_key=key, category=category,
+                    amount=amount, currency=currency, due_date=due, status="paid",
+                ))
+                counts["bills"] += 1
+                continue
+            # Newer period supersedes: settle the prior obligation, then insert the new one.
+            existing.status = "paid"
             session.add(existing)
-            continue
+
         session.add(Bill(
             source_id=source.id,
-            name=str(b["name"]).strip(),
-            category=coerce(b.get("category"), BILL_CATEGORIES, default="utility"),
-            amount=_num(b.get("amount")),
-            currency=b.get("currency") or "INR",
+            name=name,
+            norm_key=key,
+            category=category,
+            amount=amount,
+            currency=currency,
             due_date=due,
-            status=b.get("status") or "due",
+            status=status,
         ))
         counts["bills"] += 1
-
-    for t in data.get("transactions") or []:
-        amount = _num(t.get("amount"))
-        if not t.get("merchant") or amount is None:
-            continue
-        # Individual charges are never deduped by name — each is a real event.
-        # Re-ingesting the same source is prevented upstream by the content hash.
-        session.add(Transaction(
-            source_id=source.id,
-            merchant=str(t["merchant"]).strip(),
-            category=coerce(t.get("category"), TRANSACTION_CATEGORIES),
-            amount=amount,
-            currency=t.get("currency") or "INR",
-            txn_date=_parse_date(t.get("txn_date")) or source.received_at,
-            description=t.get("description") or "",
-        ))
-        counts["transactions"] += 1
 
     for d in data.get("documents") or []:
         if not d.get("title"):
@@ -284,7 +444,11 @@ def summarize_counts(counts: dict) -> str:
     updated = counts.get("subscriptions_updated", 0)
     if updated:
         parts.append(f"{updated} updated")
-    return " · ".join(parts) or "no new records"
+    summary = " · ".join(parts) or "no new records"
+    notes = counts.get("notes") or []
+    if notes:
+        summary += " — " + "; ".join(notes)
+    return summary
 
 
 def find_source_by_hash(session: Session, digest: str) -> Source | None:
@@ -312,7 +476,9 @@ def store_source(
         snippet=raw_text.strip().replace("\n", " ")[:300],
         raw_text=raw_text,
         external_id=external_id,
-        content_hash=content_hash(sender, title, raw_text),
+        # Hash body + sender only (NOT title/filename) so the same PDF re-uploaded under
+        # a different filename still dedups.
+        content_hash=content_hash(sender, raw_text),
     )
     session.add(source)
     session.commit()

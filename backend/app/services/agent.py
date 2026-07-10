@@ -7,6 +7,7 @@ from google.genai import types
 from sqlmodel import Session, select
 
 from ..models import Bill, DocumentRecord, Source, Subscription, Transaction
+from .fx import to_inr
 from .llm import generate, generate_stream
 
 MAX_TURNS = 5
@@ -116,6 +117,16 @@ def upcoming_renewals(session: Session, days: int = 60) -> dict:
     return {"days_ahead": days, "items": items}
 
 
+def _monthly_amount(s: Subscription) -> float:
+    """A subscription's cost expressed per-month in its OWN currency (yearly/weekly normalized)."""
+    amt = s.amount or 0
+    if s.billing_cycle == "yearly":
+        return amt / 12
+    if s.billing_cycle == "weekly":
+        return amt * 4.33
+    return amt
+
+
 def find_duplicate_subscriptions(session: Session) -> dict:
     subs = session.exec(select(Subscription).where(Subscription.status == "active")).all()
     by_cat: dict[str, list[Subscription]] = {}
@@ -125,13 +136,16 @@ def find_duplicate_subscriptions(session: Session) -> dict:
     for cat, group in by_cat.items():
         names = {s.name.lower() for s in group}
         if cat != "other" and len(names) > 1:
-            monthly = sum((s.amount or 0) / (12 if s.billing_cycle == "yearly" else 1) for s in group)
+            # Normalize to INR before summing — a USD + INR group otherwise produces a
+            # nonsensical combined total. combined_monthly_cost is therefore in INR.
+            monthly = sum(to_inr(_monthly_amount(s), s.currency) for s in group)
             dupes.append({
                 "category": cat,
                 "services": [{"name": s.name, "amount": s.amount, "currency": s.currency,
                               "billing_cycle": s.billing_cycle,
                               "source": _source_ref(session, s.source_id)} for s in group],
                 "combined_monthly_cost": round(monthly, 2),
+                "combined_currency": "INR",
             })
     return {"duplicate_groups": dupes}
 

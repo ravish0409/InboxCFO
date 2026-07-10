@@ -7,15 +7,17 @@ Higher layers use four things and never import `google.genai` directly:
   - LLMNotConfigured / LLMUpstreamError : typed errors routers translate into clean HTTP responses
 """
 
+import collections
 import json
 import re
+import threading
 import time
 
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-from ..config import LLM_API_KEY, LLM_MODEL, LLM_PROVIDER
+from ..config import LLM_API_KEY, LLM_MAX_RPM, LLM_MODEL, LLM_PROVIDER
 
 
 class LLMNotConfigured(Exception):
@@ -77,6 +79,35 @@ def _raise_upstream(e: genai_errors.APIError) -> "LLMUpstreamError":
     return LLMUpstreamError(f"{LLM_PROVIDER} returned an error ({code}).", 502 if code >= 500 else code)
 
 
+class _RateLimiter:
+    """Sliding-window request pacer: allows at most `max_per_min` calls in any rolling 60s
+    window. Thread-safe, and BLOCKS the caller until a slot is free — so a burst (bulk
+    upload, a 40-message Gmail sync) is spread out to stay under the provider's RPM cap
+    instead of firing all at once and getting 429'd. `max_per_min <= 0` disables pacing."""
+
+    def __init__(self, max_per_min: int):
+        self.max = max_per_min
+        self._lock = threading.Lock()
+        self._calls: "collections.deque[float]" = collections.deque()
+
+    def acquire(self) -> None:
+        if self.max <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._calls and now - self._calls[0] >= 60.0:
+                    self._calls.popleft()
+                if len(self._calls) < self.max:
+                    self._calls.append(now)
+                    return
+                wait = 60.0 - (now - self._calls[0])
+            time.sleep(min(max(wait, 0.0), 5.0) + 0.01)
+
+
+_LIMITER = _RateLimiter(LLM_MAX_RPM)
+
+
 _client: "genai.Client | None" = None
 
 
@@ -101,6 +132,7 @@ def generate(contents, config: "types.GenerateContentConfig"):
     client = get_client()
     for attempt in range(_RATE_LIMIT_RETRIES + 1):
         try:
+            _LIMITER.acquire()  # stay under the provider's RPM cap (each attempt is a call)
             return client.models.generate_content(model=LLM_MODEL, contents=contents, config=config)
         except genai_errors.APIError as e:
             if _error_code(e) == 429 and attempt < _RATE_LIMIT_RETRIES:
@@ -118,6 +150,7 @@ def generate_stream(contents, config: "types.GenerateContentConfig"):
     translated so the SSE route can emit a clean error event."""
     client = get_client()
     try:
+        _LIMITER.acquire()  # stay under the provider's RPM cap
         stream = client.models.generate_content_stream(model=LLM_MODEL, contents=contents, config=config)
         for chunk in stream:
             yield chunk

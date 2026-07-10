@@ -109,17 +109,30 @@ def build_insights(session: Session) -> dict:
     }
 
 
+def _svc_monthly_inr(s: dict) -> float:
+    """A duplicate-group service's per-month cost in INR (yearly/weekly normalized)."""
+    amt = s.get("amount") or 0
+    cycle = s.get("billing_cycle")
+    if cycle == "yearly":
+        amt = amt / 12
+    elif cycle == "weekly":
+        amt = amt * 4.33
+    return to_inr(amt, s.get("currency"))
+
+
 def _rule_based_suggestions(dupes: list[dict], subs: list[Subscription]) -> list[dict]:
     out = []
     for g in dupes:
-        cheapest = min(g["services"], key=lambda s: s.get("amount") or 0)
+        # Pick the truly cheapest across currencies and keep the saving in INR, matching
+        # the group's INR-normalized combined_monthly_cost (agent.find_duplicate_subscriptions).
+        cheapest = min(g["services"], key=_svc_monthly_inr)
         others = [s["name"] for s in g["services"] if s["name"] != cheapest["name"]]
-        saving = round(g["combined_monthly_cost"] - (cheapest.get("amount") or 0), 2)
+        saving = round(g["combined_monthly_cost"] - _svc_monthly_inr(cheapest), 2)
         out.append({
             "title": f"You pay for {len(g['services'])} {g['category']} services",
             "detail": f"Keep {cheapest['name']} and consider cancelling {', '.join(others)}.",
             "estimated_monthly_saving": saving,
-            "currency": cheapest.get("currency", "INR"),
+            "currency": "INR",
         })
     yearly_candidates = [s for s in subs if s.billing_cycle == "monthly" and (s.amount or 0) > 200]
     if yearly_candidates:

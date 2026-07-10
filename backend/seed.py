@@ -10,6 +10,7 @@ from sqlmodel import Session, SQLModel, select
 
 from app.db import engine, init_db
 from app.models import Bill, DocumentRecord, Source, Subscription, Transaction
+from app.services.extraction import _txn_dedup_key
 from app.services.normalize import content_hash, norm_key
 
 TODAY = date.today()
@@ -24,7 +25,7 @@ def lm(day: int) -> date:  # a date in last month
 def src(session: Session, title: str, sender: str, received: date, body: str, source_type="email") -> int:
     s = Source(source_type=source_type, title=title, sender=sender, received_at=received,
                snippet=body.strip().replace("\n", " ")[:300], raw_text=body,
-               content_hash=content_hash(sender, title, body))
+               content_hash=content_hash(sender, body))
     session.add(s)
     session.commit()
     session.refresh(s)
@@ -134,10 +135,19 @@ def main() -> None:
                                    provider="Dell", expiry_date=TODAY + timedelta(days=165), amount=124990,
                                    summary="Laptop warranty with onsite support."))
 
-        # Backfill norm_key so seeded subscriptions participate in upsert/dedup.
+        # Backfill norm_key so seeded subscriptions/bills participate in upsert/rollup,
+        # and dedup_key so a re-uploaded matching charge doesn't double-count.
         for sub in session.exec(select(Subscription)).all():
             sub.norm_key = norm_key(sub.name)
+            # Leave last_invoice_at unset — the stale-invoice guard activates once a real
+            # invoice arrives; seeding a future date would wrongly reject current invoices.
             session.add(sub)
+        for bill in session.exec(select(Bill)).all():
+            bill.norm_key = norm_key(bill.name)
+            session.add(bill)
+        for txn in session.exec(select(Transaction)).all():
+            txn.dedup_key = _txn_dedup_key(txn.merchant, txn.txn_date, txn.amount, txn.currency)
+            session.add(txn)
         session.commit()
 
         # Generate the initial action items (trial ending, price hike, duplicates).

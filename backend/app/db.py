@@ -18,7 +18,10 @@ _ADDED_COLUMNS = {
         "auto_renews": "BOOLEAN NOT NULL DEFAULT 1",
         "previous_amount": "FLOAT",
         "price_change_at": "DATE",
+        "last_invoice_at": "DATE",
     },
+    "bill": {"norm_key": "VARCHAR NOT NULL DEFAULT ''"},
+    "transaction": {"dedup_key": "VARCHAR NOT NULL DEFAULT ''"},
 }
 
 
@@ -32,7 +35,8 @@ def _ensure_columns() -> None:
             present = {c["name"] for c in inspector.get_columns(table)}
             for col, ddl in columns.items():
                 if col not in present:
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                    # Quote the table name — "transaction" is a reserved SQL keyword.
+                    conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN {col} {ddl}'))
 
 
 def init_db() -> None:

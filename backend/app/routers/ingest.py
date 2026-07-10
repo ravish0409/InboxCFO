@@ -86,7 +86,8 @@ async def upload_files(files: list[UploadFile], background_tasks: BackgroundTask
         try:
             fields = _parse_upload(name, f.filename or "upload", data)
             # Idempotent ingest: the same content uploaded twice is not re-extracted.
-            digest = content_hash(fields["sender"], fields["title"], fields["raw_text"])
+            # Filename is intentionally excluded so a renamed re-upload still dedups.
+            digest = content_hash(fields["sender"], fields["raw_text"])
             existing = find_source_by_hash(session, digest)
             if existing:
                 results.append({"file": f.filename, "source_id": existing.id,
@@ -192,7 +193,7 @@ async def upload_files_stream(request: Request, files: list[UploadFile]):
                                 "summary": str(e.detail), "skipped": True, "error": True})
                     continue
 
-                digest = content_hash(fields["sender"], fields["title"], fields["raw_text"])
+                digest = content_hash(fields["sender"], fields["raw_text"])
                 existing = find_source_by_hash(session, digest)
                 if existing:
                     yield _sse({"type": "line", "index": i, "file": filename,

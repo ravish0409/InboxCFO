@@ -37,12 +37,16 @@ class Subscription(SQLModel, table=True):
     auto_renews: bool = True
     previous_amount: Optional[float] = None  # set on upsert when the price changes
     price_change_at: Optional[date] = None
+    # received_at of the source that last advanced this row — the recency anchor used to
+    # reject stale (older) invoices and to roll `next_renewal` forward, never backward.
+    last_invoice_at: Optional[date] = None
 
 
 class Bill(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     source_id: Optional[int] = Field(default=None, foreign_key="source.id")
     name: str  # e.g. "BESCOM Electricity"
+    norm_key: str = Field(default="", index=True)  # normalized name, for recurring-bill rollup
     category: str = "utility"  # utility | insurance | rent | telecom | other
     amount: Optional[float] = None
     currency: str = "INR"
@@ -59,6 +63,9 @@ class Transaction(SQLModel, table=True):
     currency: str = "INR"
     txn_date: Optional[date] = None
     description: str = ""
+    # merchant|date|amount|currency fingerprint, so the same charge from two sources
+    # (or a re-derived subscription payment) is only counted once.
+    dedup_key: str = Field(default="", index=True)
 
 
 class DocumentRecord(SQLModel, table=True):
