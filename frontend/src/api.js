@@ -40,6 +40,24 @@ export const api = {
       body: JSON.stringify({ question, history }),
     }),
   chatStream: (question, history, handlers) => streamChat(question, history, handlers),
+  // Saved chat conversations. `messages` carry the durable display fields
+  // (content, tool trace, cited sources) — see backend conversations router.
+  conversations: () => request('/api/conversations'),
+  conversation: (id) => request(`/api/conversations/${id}`),
+  createConversation: (messages) =>
+    request('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    }),
+  saveConversation: (id, messages) =>
+    request(`/api/conversations/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+    }),
+  deleteConversation: (id) =>
+    request(`/api/conversations/${id}`, { method: 'DELETE' }),
   upload: (files) => {
     const form = new FormData()
     for (const f of files) form.append('files', f)

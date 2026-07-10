@@ -91,6 +91,29 @@ class InsightsCache(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class Conversation(SQLModel, table=True):
+    """A saved assistant chat thread. Messages hang off it via conversation_id."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str = "New chat"  # derived from the first user turn
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow, index=True)
+
+
+class ChatMessage(SQLModel, table=True):
+    """One turn in a conversation. trace (tool steps) and sources (cited emails) are
+    stored as JSON strings since they're opaque display payloads, not queried columns."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    conversation_id: int = Field(foreign_key="conversation.id", index=True)
+    position: int = 0  # 0-based order within the conversation
+    role: str = "user"  # user | assistant
+    content: str = ""
+    trace_json: str = "[]"  # JSON-encoded list[{"tool": str}]
+    sources_json: str = "[]"  # JSON-encoded list[dict]
+    error: bool = False
+
+
 class ActionItem(SQLModel, table=True):
     """A surfaced 'thing to review' — the draft-and-approve unit. Regenerated
     idempotently from current signals (keyed by dedup_key) while preserving the

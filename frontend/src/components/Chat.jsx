@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bot, SendHorizonal, X } from 'lucide-react'
-import { api } from '../api'
+import { Bot, History, SendHorizonal, SquarePen, Trash2, X } from 'lucide-react'
+import { api, fmtRel } from '../api'
+import { useChatSessions } from '../chatStore'
 import { EvidenceChip } from './Evidence'
 import { Markdown } from './Markdown'
 import { btn, focusRing } from '../ui'
@@ -55,11 +56,81 @@ function TypingDots() {
   )
 }
 
+// The saved-conversation list. Replaces the message area when the user opens history.
+function HistoryPanel({ sessions, activeId, onOpen, onRemove, onClose }) {
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-1.5">
+      {!sessions.length && (
+        <p className="text-sm text-faint px-1 py-2">No saved conversations yet.</p>
+      )}
+      {sessions.map((s) => (
+        <div
+          key={s.id}
+          className={`group flex items-center gap-2 rounded-lg border px-3 py-2 transition-colors duration-150 ${
+            s.id === activeId ? 'border-accent bg-accent-soft' : 'border-line hover:border-line-strong hover:bg-inset'
+          }`}
+        >
+          <button
+            onClick={() => { onOpen(s.id); onClose() }}
+            className={`min-w-0 flex-1 text-left cursor-pointer ${focusRing} rounded`}
+          >
+            <div className="text-sm text-ink truncate">{s.title}</div>
+            <div className="text-[11px] text-faint">{fmtRel(s.updated_at)}</div>
+          </button>
+          <button
+            onClick={() => onRemove(s.id)}
+            aria-label="Delete conversation"
+            className={`shrink-0 text-faint hover:text-alert transition-colors duration-150 rounded p-1 cursor-pointer ${focusRing}`}
+          >
+            <Trash2 size={14} strokeWidth={1.75} />
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function Chat({ onShowSource, onBusy, onClose }) {
+  const {
+    sessions, activeId, commit, startNew, open, remove,
+    fetchMessages, takeSkipLoad, markLoaded,
+  } = useChatSessions()
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
+  // The conversation `messages` currently belong to; kept in step with activeId so a
+  // commit never fires with a stale (wrong-conversation) message list mid-load.
+  const [loadedFor, setLoadedFor] = useState(null)
   const bottomRef = useRef(null)
+
+  // Load a conversation's messages whenever the active conversation changes
+  // (startup, switching from history, or starting a new chat).
+  useEffect(() => {
+    if (activeId == null) { setMessages([]); setLoadedFor(null); return }
+    // We just created/saved these locally — keep them, don't refetch and overwrite.
+    if (takeSkipLoad(activeId)) { setLoadedFor(activeId); return }
+    let cancelled = false
+    setLoadedFor(undefined) // loading — suppresses commit until the fetch lands
+    fetchMessages(activeId).then((msgs) => {
+      if (cancelled) return
+      setMessages(msgs.map((m) => ({ ...m })))
+      markLoaded(activeId, msgs)
+      setLoadedFor(activeId)
+    })
+    return () => { cancelled = true }
+  }, [activeId, fetchMessages, takeSkipLoad, markLoaded])
+
+  // Persist after each completed turn — gated on `!busy` (never mid-stream) and on the
+  // messages actually belonging to the active conversation.
+  useEffect(() => {
+    if (!busy && loadedFor === activeId) commit(messages)
+  }, [busy, messages, loadedFor, activeId, commit])
+
+  function handleNewChat() {
+    setShowHistory(false)
+    startNew()
+  }
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -115,9 +186,30 @@ export function Chat({ onShowSource, onBusy, onClose }) {
           <Bot size={16} strokeWidth={1.75} />
         </span>
         <div className="min-w-0 flex-1 leading-tight">
-          <div className="text-sm font-semibold text-ink">Assistant</div>
-          <div className="text-[11px] text-faint truncate">Every answer cites the emails it came from</div>
+          <div className="text-sm font-semibold text-ink">{showHistory ? 'Chat history' : 'Assistant'}</div>
+          <div className="text-[11px] text-faint truncate">
+            {showHistory ? 'Your saved conversations' : 'Every answer cites the emails it came from'}
+          </div>
         </div>
+        <button
+          onClick={() => setShowHistory((h) => !h)}
+          aria-label="Chat history"
+          aria-pressed={showHistory}
+          title="Chat history"
+          className={`transition-colors duration-150 rounded-md p-1 cursor-pointer ${focusRing} ${
+            showHistory ? 'text-accent' : 'text-faint hover:text-ink'
+          }`}
+        >
+          <History size={16} strokeWidth={1.75} />
+        </button>
+        <button
+          onClick={handleNewChat}
+          aria-label="New chat"
+          title="New chat"
+          className={`text-faint hover:text-ink transition-colors duration-150 rounded-md p-1 cursor-pointer ${focusRing}`}
+        >
+          <SquarePen size={16} strokeWidth={1.75} />
+        </button>
         <button
           onClick={onClose}
           aria-label="Close assistant"
@@ -126,6 +218,19 @@ export function Chat({ onShowSource, onBusy, onClose }) {
           <X size={16} strokeWidth={1.75} />
         </button>
       </div>
+
+      {showHistory && (
+        <HistoryPanel
+          sessions={sessions}
+          activeId={activeId}
+          onOpen={open}
+          onRemove={remove}
+          onClose={() => setShowHistory(false)}
+        />
+      )}
+      {!showHistory && (
+      <>
+
 
       <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
         {!messages.length && (
@@ -190,6 +295,8 @@ export function Chat({ onShowSource, onBusy, onClose }) {
           <SendHorizonal size={15} strokeWidth={1.75} />
         </button>
       </form>
+      </>
+      )}
     </div>
   )
 }
