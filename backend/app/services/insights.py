@@ -1,10 +1,15 @@
-"""Insights: rule-based duplicate detection (always works) + LLM savings suggestions (optional)."""
+"""Insights: rule-based duplicate detection (always works) + LLM savings suggestions (optional).
 
-from datetime import date
+The LLM suggestions are expensive, so they are cached in the DB (InsightsCache) and only
+regenerated on ingest via `regenerate_suggestions`. GET /api/insights reads the cache and
+never blocks on a live LLM call; the rule-based parts are recomputed fresh each request."""
+
+import json
+from datetime import date, datetime
 
 from sqlmodel import Session, select
 
-from ..models import Bill, Subscription
+from ..models import InsightsCache, Subscription
 from .agent import find_duplicate_subscriptions, upcoming_renewals
 from .llm import LLMNotConfigured, chat_json
 
@@ -20,12 +25,19 @@ def _monthly_cost(s: Subscription) -> float:
     return s.amount / 12 if s.billing_cycle == "yearly" else s.amount * (4.33 if s.billing_cycle == "weekly" else 1)
 
 
-def build_insights(session: Session) -> dict:
+def _compute_rule_based(session: Session):
+    """The instant, always-fresh part of insights: subs, duplicate groups, renewals, total."""
     subs = session.exec(select(Subscription).where(Subscription.status == "active")).all()
     dupes = find_duplicate_subscriptions(session)["duplicate_groups"]
     renewals = upcoming_renewals(session, days=45)["items"]
     total_monthly = round(sum(_monthly_cost(s) for s in subs), 2)
+    return subs, dupes, renewals, total_monthly
 
+
+def regenerate_suggestions(session: Session) -> InsightsCache:
+    """Call the LLM for savings suggestions and persist them. Falls back to rule-based
+    suggestions when the LLM is unconfigured or fails. Call this on ingest — not on read."""
+    subs, dupes, renewals, total_monthly = _compute_rule_based(session)
     summary = {
         "total_monthly_subscription_cost": total_monthly,
         "subscriptions": [
@@ -36,24 +48,44 @@ def build_insights(session: Session) -> dict:
         "upcoming_45_days": renewals,
     }
 
-    suggestions: list[dict]
     llm_used = False
     try:
         data = chat_json(SAVINGS_SYSTEM, str(summary))
         suggestions = data.get("suggestions") or []
         llm_used = True
-    except LLMNotConfigured:
+    except (LLMNotConfigured, Exception):
         suggestions = _rule_based_suggestions(dupes, subs)
-    except Exception:
-        suggestions = _rule_based_suggestions(dupes, subs)
+
+    cache = session.get(InsightsCache, 1)
+    if cache is None:
+        cache = InsightsCache(id=1)
+        session.add(cache)
+    cache.suggestions_json = json.dumps(suggestions)
+    cache.llm_used = llm_used
+    cache.updated_at = datetime.utcnow()
+    session.commit()
+    session.refresh(cache)
+    return cache
+
+
+def build_insights(session: Session) -> dict:
+    """Read path for GET /api/insights. Rule-based parts are recomputed fresh; the LLM
+    suggestions come from the cache. On a cold cache (first run) it generates once so the
+    user isn't left with an empty panel; the cache then survives restarts."""
+    subs, dupes, renewals, total_monthly = _compute_rule_based(session)
+
+    cache = session.get(InsightsCache, 1)
+    if cache is None:
+        cache = regenerate_suggestions(session)
 
     return {
         "as_of": date.today().isoformat(),
         "total_monthly_subscription_cost": total_monthly,
         "duplicate_groups": dupes,
         "upcoming_renewals": renewals,
-        "suggestions": suggestions,
-        "llm_used": llm_used,
+        "suggestions": json.loads(cache.suggestions_json or "[]"),
+        "llm_used": cache.llm_used,
+        "suggestions_updated_at": cache.updated_at.isoformat(),
     }
 
 

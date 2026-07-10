@@ -7,6 +7,7 @@ from ..db import get_session
 from ..services.actions import refresh_action_items
 from ..services.extraction import extract_source, find_source_by_hash, store_source
 from ..services.gmail_sync import GmailNotConfigured, sync_inbox
+from ..services.insights import regenerate_suggestions
 from ..services.llm import LLMNotConfigured, LLMUpstreamError
 from ..services.normalize import content_hash
 from ..services.pdf import parse_eml, pdf_to_text
@@ -57,6 +58,7 @@ async def upload_files(files: list[UploadFile], session: Session = Depends(get_s
         except LLMUpstreamError as e:
             raise HTTPException(e.status_code, str(e))
     refresh_action_items(session)  # surface new trials/renewals/price hikes immediately
+    regenerate_suggestions(session)  # refresh cached savings insights off the read path
     return {"results": results}
 
 
@@ -65,6 +67,7 @@ def sync_gmail(max_messages: int | None = None, session: Session = Depends(get_s
     try:
         result = sync_inbox(session, max_messages)
         refresh_action_items(session)
+        regenerate_suggestions(session)  # refresh cached savings insights off the read path
         return result
     except GmailNotConfigured as e:
         raise HTTPException(503, str(e))

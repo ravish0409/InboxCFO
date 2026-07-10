@@ -73,6 +73,17 @@ class DocumentRecord(SQLModel, table=True):
     summary: str = ""
 
 
+class InsightsCache(SQLModel, table=True):
+    """Cached LLM savings suggestions. Single row (id=1). Regenerated on ingest so
+    that GET /api/insights never blocks on a live LLM call. The rule-based parts of
+    insights (duplicates, renewals, totals) are recomputed fresh each request."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    suggestions_json: str = "[]"  # JSON-encoded list[dict]
+    llm_used: bool = False
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class ActionItem(SQLModel, table=True):
     """A surfaced 'thing to review' — the draft-and-approve unit. Regenerated
     idempotently from current signals (keyed by dedup_key) while preserving the
