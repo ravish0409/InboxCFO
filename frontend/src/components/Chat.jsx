@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Bot, SendHorizonal, X } from 'lucide-react'
 import { api } from '../api'
 import { EvidenceChip } from './Evidence'
+import { Markdown } from './Markdown'
 import { btn, focusRing } from '../ui'
 
 const SUGGESTIONS = [
@@ -42,6 +43,18 @@ function WorkReceipt({ trace }) {
   )
 }
 
+// Three pulsing dots shown in the assistant bubble before the first token arrives.
+function TypingDots() {
+  return (
+    <span className="inline-flex items-center gap-1 py-0.5" aria-label="Assistant is typing">
+      {[0, 1, 2].map((i) => (
+        <span key={i} className="inline-block w-1.5 h-1.5 rounded-full bg-faint motion-safe:animate-pulse"
+              style={{ animationDelay: `${i * 150}ms` }} />
+      ))}
+    </span>
+  )
+}
+
 export function Chat({ onShowSource, onBusy, onClose }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
@@ -55,21 +68,41 @@ export function Chat({ onShowSource, onBusy, onClose }) {
   async function ask(question) {
     if (!question.trim() || busy) return
     setInput('')
-    setMessages((m) => [...m, { role: 'user', content: question }])
+    const history = messages.map(({ role, content }) => ({ role, content }))
+    // Append the user turn plus an empty assistant placeholder we stream into.
+    setMessages((m) => [
+      ...m,
+      { role: 'user', content: question },
+      { role: 'assistant', content: '', trace: [], streaming: true },
+    ])
     setBusy(true)
     onBusy?.('checking your data…')
+
+    // Patch the in-flight assistant message (always the last one).
+    const patch = (fn) => setMessages((m) => {
+      const copy = m.slice()
+      copy[copy.length - 1] = fn(copy[copy.length - 1])
+      return copy
+    })
+
     try {
-      const history = messages.map(({ role, content }) => ({ role, content }))
-      const res = await api.chat(question, history)
-      setMessages((m) => [...m, { role: 'assistant', content: res.answer, sources: res.sources, trace: res.tool_trace }])
+      await api.chatStream(question, history, {
+        onTool: (tool) => patch((a) => ({ ...a, trace: [...(a.trace || []), { tool }] })),
+        onToken: (text) => patch((a) => ({ ...a, content: (a.content || '') + text })),
+        onSources: (sources) => patch((a) => ({ ...a, sources })),
+        // A mid-stream server error: keep whatever streamed, otherwise show the reason.
+        onError: (message) =>
+          patch((a) => ({ ...a, error: !a.content, content: a.content || `The agent couldn't answer — ${message}` })),
+      })
     } catch (e) {
       // The server's message (quota exhausted, no key, etc.) is already actionable;
       // only the offline case needs the "is the backend running?" nudge.
-      setMessages((m) => [...m, {
-        role: 'assistant', error: true,
+      patch((a) => ({
+        ...a, error: true,
         content: e.offline ? e.message : `The agent couldn't answer — ${e.message}`,
-      }])
+      }))
     } finally {
+      patch((a) => ({ ...a, streaming: false }))
       setBusy(false)
       onBusy?.(null)
     }
@@ -109,43 +142,42 @@ export function Chat({ onShowSource, onBusy, onClose }) {
           </div>
         )}
 
-        {messages.map((m, i) => (
-          <div key={i} className="fade-in">
-            {m.role === 'assistant' && !m.error && <WorkReceipt trace={m.trace} />}
-            <div className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
-              <div className={`max-w-[85%] text-sm whitespace-pre-wrap px-3.5 py-2.5 ${
-                m.role === 'user'
-                  ? 'bg-ink text-white rounded-2xl rounded-br-md'
-                  : m.error
-                    ? 'bg-alert-soft text-alert rounded-2xl rounded-bl-md'
-                    : 'bg-inset text-ink rounded-2xl rounded-bl-md'
-              }`}>
-                {m.content}
-                {!!m.sources?.length && (
-                  <div className="mt-2 pt-2 border-t border-line-strong/40 flex flex-wrap gap-1.5">
-                    {m.sources.slice(0, 4).map((s) => (
-                      <EvidenceChip
-                        key={s.source_id}
-                        label={s.title}
-                        title={`${s.sender || ''} ${s.date || ''}`.trim()}
-                        onClick={() => onShowSource(s.source_id)}
-                      />
-                    ))}
-                  </div>
-                )}
+        {messages.map((m, i) => {
+          const isAssistant = m.role === 'assistant'
+          const plainText = m.role === 'user' || m.error
+          return (
+            <div key={i} className="fade-in">
+              {isAssistant && !m.error && <WorkReceipt trace={m.trace} />}
+              <div className={m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}>
+                <div className={`max-w-[85%] text-sm px-3.5 py-2.5 ${plainText ? 'whitespace-pre-wrap' : ''} ${
+                  m.role === 'user'
+                    ? 'bg-ink text-white rounded-2xl rounded-br-md'
+                    : m.error
+                      ? 'bg-alert-soft text-alert rounded-2xl rounded-bl-md'
+                      : 'bg-inset text-ink rounded-2xl rounded-bl-md'
+                }`}>
+                  {isAssistant && !m.error
+                    ? (m.content
+                        ? <Markdown>{m.content}</Markdown>
+                        : m.streaming && <TypingDots />)
+                    : m.content}
+                  {!!m.sources?.length && (
+                    <div className="mt-2 pt-2 border-t border-line-strong/40 flex flex-wrap gap-1.5">
+                      {m.sources.slice(0, 4).map((s) => (
+                        <EvidenceChip
+                          key={s.source_id}
+                          label={s.title}
+                          title={`${s.sender || ''} ${s.date || ''}`.trim()}
+                          onClick={() => onShowSource(s.source_id)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
-          </div>
-        ))}
-
-        {busy && (
-          <div className="fade-in">
-            <span className="inline-flex items-center gap-1.5 font-mono text-[11px] text-accent bg-accent-soft rounded-md px-2 py-1">
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
-              checking your data…
-            </span>
-          </div>
-        )}
+          )
+        })}
         <div ref={bottomRef} />
       </div>
 

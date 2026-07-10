@@ -1,7 +1,7 @@
 fastapi==0.115.*
 uvicorn[standard]==0.30.*
 sqlmodel==0.0.22
-openai>=1.40,<2
+google-genai>=2.11
 python-multipart
 pymupdf>=1.24
 python-dotenv

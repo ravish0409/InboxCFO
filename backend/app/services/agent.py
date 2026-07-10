@@ -1,13 +1,13 @@
-"""Chat agent: Fireworks tool-calling over the structured DB (never over raw emails)."""
+"""Chat agent: Gemini function-calling over the structured DB (never over raw emails)."""
 
 import json
 from datetime import date, timedelta
 
+from google.genai import types
 from sqlmodel import Session, select
 
-from ..config import AGENT_TOOL_MODE
 from ..models import Bill, DocumentRecord, Source, Subscription, Transaction
-from .llm import _parse_json_lenient, chat_raw
+from .llm import generate, generate_stream
 
 MAX_TURNS = 5
 
@@ -288,16 +288,62 @@ Rules:
   If it surfaces a free trial ending or a duplicate, proactively OFFER to draft a cancellation.
 - When the user asks to cancel something (or accepts your offer), call draft_cancellation with the name.
   You draft the email for their approval — you never send it. Tell them it's a draft to review and send.
-- If a tool returns nothing relevant, say you couldn't find it in the ingested data."""
+- If a tool returns nothing relevant, say you couldn't find it in the ingested data.
 
-JSON_MODE_SUFFIX = """
+Formatting: reply in GitHub-flavored Markdown. Put money amounts and service names in **bold**
+(e.g. **₹499/mo** for **Netflix**). Use a short `-` bullet list when you name several
+subscriptions, bills or charges; keep single-fact answers to one or two sentences with no list.
+When you present a drafted cancellation email, put its full text in a fenced ``` code block."""
 
-You do not have native tool-calling. Instead reply with EXACTLY ONE JSON object per turn, no other text:
-- To call a tool: {"tool": "<name>", "args": {...}}
-  Available tools: total_spend(start_date?, end_date?), spend_by_category(category, start_date?, end_date?),
-  spend_by_merchant(merchant, start_date?, end_date?), list_subscriptions(), upcoming_renewals(days?),
-  find_duplicate_subscriptions(), find_documents(query), list_action_items(), draft_cancellation(subscription_name)
-- To answer the user: {"answer": "<your final answer>"}"""
+
+def _build_tool() -> "types.Tool":
+    """Convert the OpenAI-shaped TOOL_SCHEMAS into one Gemini Tool. The parameter blocks are
+    already JSON Schema, so they pass straight through as `parameters_json_schema`."""
+    decls = []
+    for t in TOOL_SCHEMAS:
+        fn = t["function"]
+        decls.append(types.FunctionDeclaration(
+            name=fn["name"],
+            description=fn["description"],
+            parameters_json_schema=fn.get("parameters") or {"type": "object", "properties": {}},
+        ))
+    return types.Tool(function_declarations=decls)
+
+
+_TOOL = _build_tool()
+
+
+def _config(system: str) -> "types.GenerateContentConfig":
+    # Declarations-only tools: the SDK returns the function calls to us to run, rather than
+    # trying to auto-invoke (which it can't — these aren't Python callables). Disable AFC
+    # explicitly so a future SDK default can't start swallowing our calls.
+    return types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=0.1,
+        tools=[_TOOL],
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+    )
+
+
+def _to_contents(question: str, history: list[dict] | None) -> list:
+    """Prior turns + the new question as Gemini `Content`. Roles map user→user, assistant→model."""
+    contents: list = []
+    for h in (history or [])[-6:]:
+        role, text = h.get("role"), h.get("content")
+        if role in ("user", "assistant") and text:
+            contents.append(types.Content(
+                role="model" if role == "assistant" else "user",
+                parts=[types.Part(text=text)],
+            ))
+    contents.append(types.Content(role="user", parts=[types.Part(text=question)]))
+    return contents
+
+
+def _tool_response_part(name: str, result: dict) -> "types.Part":
+    # from_function_response needs a JSON-safe dict; tool results carry ISO date strings but
+    # round-trip through json to be certain nothing (e.g. a stray date) breaks serialization.
+    safe = json.loads(json.dumps(result, default=str))
+    return types.Part.from_function_response(name=name, response=safe)
 
 
 def _collect_sources(obj, acc: list[dict]) -> None:
@@ -324,56 +370,84 @@ def _run_tool(session: Session, name: str, args: dict) -> dict:
 
 
 def answer_question(session: Session, question: str, history: list[dict] | None = None) -> dict:
+    """Non-streaming answer (used by POST /api/chat). Runs the Gemini function-calling loop:
+    each turn either returns function calls to run, or the final text answer."""
     system = SYSTEM_PROMPT.format(today=date.today().isoformat())
-    if AGENT_TOOL_MODE == "json":
-        system += JSON_MODE_SUFFIX
-    messages: list[dict] = [{"role": "system", "content": system}]
-    for h in (history or [])[-6:]:
-        if h.get("role") in ("user", "assistant") and h.get("content"):
-            messages.append({"role": h["role"], "content": h["content"]})
-    messages.append({"role": "user", "content": question})
-
+    config = _config(system)
+    contents = _to_contents(question, history)
     sources: list[dict] = []
     trace: list[dict] = []
 
     for _ in range(MAX_TURNS):
-        if AGENT_TOOL_MODE == "json":
-            resp = chat_raw(messages)
-            content = resp.choices[0].message.content or ""
-            try:
-                obj = _parse_json_lenient(content)
-            except Exception:
-                return {"answer": content, "sources": sources, "tool_trace": trace}
-            if "answer" in obj:
-                return {"answer": str(obj["answer"]), "sources": sources, "tool_trace": trace}
-            name, args = obj.get("tool", ""), obj.get("args") or {}
-            result = _run_tool(session, name, args)
+        resp = generate(contents, config)
+        calls = resp.function_calls or []
+        if not calls:
+            return {"answer": resp.text or "", "sources": sources, "tool_trace": trace}
+
+        contents.append(resp.candidates[0].content)  # the model's function-call turn
+        response_parts = []
+        for fc in calls:
+            args = dict(fc.args or {})
+            result = _run_tool(session, fc.name, args)
             _collect_sources(result, sources)
-            trace.append({"tool": name, "args": args})
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user",
-                             "content": f"Tool result for {name}: {json.dumps(result, default=str)}"})
-        else:
-            resp = chat_raw(messages, tools=TOOL_SCHEMAS)
-            msg = resp.choices[0].message
-            if not msg.tool_calls:
-                return {"answer": msg.content or "", "sources": sources, "tool_trace": trace}
-            messages.append({
-                "role": "assistant", "content": msg.content,
-                "tool_calls": [tc.model_dump() for tc in msg.tool_calls],
-            })
-            for tc in msg.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                result = _run_tool(session, tc.function.name, args)
-                _collect_sources(result, sources)
-                trace.append({"tool": tc.function.name, "args": args})
-                messages.append({
-                    "role": "tool", "tool_call_id": tc.id,
-                    "content": json.dumps(result, default=str),
-                })
+            trace.append({"tool": fc.name, "args": args})
+            response_parts.append(_tool_response_part(fc.name, result))
+        contents.append(types.Content(role="user", parts=response_parts))
 
     return {"answer": "I couldn't complete that within my step limit — try a simpler question.",
             "sources": sources, "tool_trace": trace}
+
+
+def stream_answer(session: Session, question: str, history: list[dict] | None = None):
+    """Generator yielding SSE-shaped events for the chat stream:
+      {"type": "tool", "tool": <name>}     — a tool step, as it happens
+      {"type": "token", "text": <chunk>}   — a fragment of the final answer
+      {"type": "sources", "sources": [...]}— evidence, once at the end
+
+    Each Gemini turn is streamed. Text parts are forwarded as tokens; function-call parts
+    are collected (Gemini may send them across chunks — merge args by name), executed, and
+    fed back as function responses. Loops until a turn produces text with no function call.
+    """
+    system = SYSTEM_PROMPT.format(today=date.today().isoformat())
+    config = _config(system)
+    contents = _to_contents(question, history)
+    sources: list[dict] = []
+
+    for _ in range(MAX_TURNS):
+        text_accum = ""
+        fc_parts: list = []          # ORIGINAL function_call parts (carry thought_signature)
+        exec_calls: list = []        # (name, args) to run, in arrival order
+        for chunk in generate_stream(contents, config):
+            candidate = (chunk.candidates or [None])[0]
+            if not candidate or not candidate.content or not candidate.content.parts:
+                continue
+            for part in candidate.content.parts:
+                if part.function_call:
+                    # Keep the part verbatim — Gemini 3.x rejects the follow-up turn if the
+                    # function_call is resent without its thought_signature.
+                    fc_parts.append(part)
+                    exec_calls.append((part.function_call.name, dict(part.function_call.args or {})))
+                elif part.text and not part.thought:  # skip the model's thinking summary
+                    text_accum += part.text
+                    yield {"type": "token", "text": part.text}
+
+        if not fc_parts:
+            yield {"type": "sources", "sources": sources}
+            return
+
+        # Replay the model's turn verbatim (original parts, signatures intact), then answer
+        # each call with a function response.
+        model_parts = ([types.Part(text=text_accum)] if text_accum else []) + fc_parts
+        contents.append(types.Content(role="model", parts=model_parts))
+
+        response_parts = []
+        for name, args in exec_calls:
+            yield {"type": "tool", "tool": name}
+            result = _run_tool(session, name, args)
+            _collect_sources(result, sources)
+            response_parts.append(_tool_response_part(name, result))
+        contents.append(types.Content(role="user", parts=response_parts))
+
+    yield {"type": "token",
+           "text": "I couldn't complete that within my step limit — try a simpler question."}
+    yield {"type": "sources", "sources": sources}

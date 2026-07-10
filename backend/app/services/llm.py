@@ -1,23 +1,21 @@
-"""Thin wrapper around an OpenAI-compatible chat API (Fireworks or Gemini).
+"""Thin wrapper around the native Google Gen AI SDK (`google-genai`).
 
-Provider is resolved in config: Gemini is used when GEMINI_API_KEY is set, else Fireworks.
-Gemini exposes an OpenAI-compatible endpoint, so the same client and calls work for both.
+The app runs on Gemini via `client.models.generate_content` / `generate_content_stream`.
+Higher layers use four things and never import `google.genai` directly:
+  - chat_json / chat_text : one-shot JSON / free-text completions (extraction, insights, drafts)
+  - generate / generate_stream : raw calls the chat agent drives for function-calling
+  - LLMNotConfigured / LLMUpstreamError : typed errors routers translate into clean HTTP responses
 """
 
 import json
 import re
 import time
 
-from openai import (
-    APIConnectionError,
-    APIError,
-    APIStatusError,
-    APITimeoutError,
-    OpenAI,
-    RateLimitError,
-)
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 
-from ..config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_PROVIDER
+from ..config import LLM_API_KEY, LLM_MODEL, LLM_PROVIDER
 
 
 class LLMNotConfigured(Exception):
@@ -25,23 +23,33 @@ class LLMNotConfigured(Exception):
 
 
 class LLMUpstreamError(Exception):
-    """The LLM provider was reachable but returned an error (rate limit, auth,
-    timeout, outage). Carries an HTTP `status_code` so routers can surface a
-    clean, actionable response instead of a bare 500."""
+    """The LLM provider was reachable but returned an error (rate limit, auth, timeout,
+    outage). Carries an HTTP `status_code` so routers can surface a clean, actionable
+    response instead of a bare 500."""
 
     def __init__(self, message: str, status_code: int = 502):
         super().__init__(message)
         self.status_code = status_code
 
 
-# Gemini free tier caps requests *per minute*, so the agent's burst of tool-calling
-# turns routinely trips a 429 that clears within seconds. Retry those here; only a
-# limit that persists across all retries (e.g. the daily cap) reaches the user.
+# Gemini's free tier caps requests *per minute*, so a burst of tool-calling turns can trip
+# a 429 that clears within seconds. Retry those on the non-streaming path; only a limit that
+# persists across all retries (e.g. the daily cap) reaches the user.
 _RATE_LIMIT_RETRIES = 2
 _MAX_RETRY_SLEEP = 30.0
+# Fail fast instead of hanging: cap each request (milliseconds, per google-genai HttpOptions).
+_REQUEST_TIMEOUT_MS = 45_000
 
 
-def _retry_delay(e: RateLimitError, attempt: int) -> float:
+def _error_code(e: genai_errors.APIError) -> int:
+    code = getattr(e, "code", None)
+    if isinstance(code, int):
+        return code
+    m = re.search(r"\b(4\d\d|5\d\d)\b", str(e))
+    return int(m.group(1)) if m else 502
+
+
+def _retry_delay(e: Exception, attempt: int) -> float:
     """Seconds to wait before retrying a 429. Gemini includes a RetryInfo delay
     (e.g. 'retryDelay': '7s') in the error body; fall back to exponential backoff."""
     m = re.search(r"retryDelay['\"]?\s*:\s*['\"]?(\d+)", str(e))
@@ -49,59 +57,76 @@ def _retry_delay(e: RateLimitError, attempt: int) -> float:
     return min(delay, _MAX_RETRY_SLEEP)
 
 
-def _complete(client: "OpenAI", **kwargs):
-    """Run a chat completion, translating provider SDK errors into LLMUpstreamError.
-
-    Without this, an upstream 429/5xx bubbles up as an uncaught exception and the
-    API returns an opaque 500 ("Couldn't reach the agent") — misleading, since the
-    backend is fine and the provider is the one refusing the call.
-    """
-    try:
-        for attempt in range(_RATE_LIMIT_RETRIES + 1):
-            try:
-                return client.chat.completions.create(**kwargs)
-            except RateLimitError as e:
-                if attempt == _RATE_LIMIT_RETRIES:
-                    raise
-                time.sleep(_retry_delay(e, attempt))
-    except RateLimitError as e:
-        raise LLMUpstreamError(
+def _raise_upstream(e: genai_errors.APIError) -> "LLMUpstreamError":
+    """Translate a google-genai APIError into an LLMUpstreamError. Returns the exception
+    so callers can `raise _raise_upstream(e)` and keep the traceback readable."""
+    code = _error_code(e)
+    if code == 429:
+        return LLMUpstreamError(
             f"{LLM_PROVIDER} is rate-limited (429) and retrying didn't clear it. "
             "Per-minute limits usually reset within a minute — try again shortly. "
             "If it persists, the daily free-tier quota may be exhausted: wait, "
-            "switch LLM_PROVIDER, or use a paid key.",
+            "switch the model/key, or use a paid key.",
             429,
-        ) from e
-    except APITimeoutError as e:
-        raise LLMUpstreamError(f"{LLM_PROVIDER} timed out. Try again.", 504) from e
-    except APIConnectionError as e:
-        raise LLMUpstreamError(
-            f"Couldn't reach {LLM_PROVIDER}. Check the network and LLM_BASE_URL.", 502
-        ) from e
-    except APIStatusError as e:
-        # Auth (401/403) and other provider-side status errors.
-        raise LLMUpstreamError(
-            f"{LLM_PROVIDER} returned an error ({e.status_code}). "
-            "Check the API key and model name.",
-            502 if e.status_code >= 500 else e.status_code,
-        ) from e
-    except APIError as e:
-        raise LLMUpstreamError(f"{LLM_PROVIDER} call failed: {e}", 502) from e
+        )
+    if code in (401, 403):
+        return LLMUpstreamError(
+            f"{LLM_PROVIDER} rejected the request ({code}). Check GEMINI_API_KEY and the model name.",
+            code,
+        )
+    return LLMUpstreamError(f"{LLM_PROVIDER} returned an error ({code}).", 502 if code >= 500 else code)
 
 
-_client: OpenAI | None = None
+_client: "genai.Client | None" = None
 
 
-def get_client() -> OpenAI:
+def get_client() -> "genai.Client":
     global _client
     if not LLM_API_KEY:
         raise LLMNotConfigured(
-            "No LLM API key set. Copy backend/.env.example to backend/.env and add either "
-            "GEMINI_API_KEY (preferred) or FIREWORKS_API_KEY."
+            "No LLM API key set. Copy backend/.env.example to backend/.env and add "
+            "GEMINI_API_KEY (LLM_PROVIDER=gemini)."
         )
     if _client is None:
-        _client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+        _client = genai.Client(
+            api_key=LLM_API_KEY,
+            http_options=types.HttpOptions(timeout=_REQUEST_TIMEOUT_MS),
+        )
     return _client
+
+
+def generate(contents, config: "types.GenerateContentConfig"):
+    """One non-streaming completion, with 429 retry and error translation. `contents` may
+    be a plain string or a list of types.Content. Returns the raw GenerateContentResponse."""
+    client = get_client()
+    for attempt in range(_RATE_LIMIT_RETRIES + 1):
+        try:
+            return client.models.generate_content(model=LLM_MODEL, contents=contents, config=config)
+        except genai_errors.APIError as e:
+            if _error_code(e) == 429 and attempt < _RATE_LIMIT_RETRIES:
+                time.sleep(_retry_delay(e, attempt))
+                continue
+            raise _raise_upstream(e) from e
+        except (LLMNotConfigured, LLMUpstreamError):
+            raise
+        except Exception as e:
+            raise LLMUpstreamError(f"Couldn't reach {LLM_PROVIDER}: {e}", 502) from e
+
+
+def generate_stream(contents, config: "types.GenerateContentConfig"):
+    """Streaming completion — yields raw chunks. No mid-stream retry (fail fast); errors are
+    translated so the SSE route can emit a clean error event."""
+    client = get_client()
+    try:
+        stream = client.models.generate_content_stream(model=LLM_MODEL, contents=contents, config=config)
+        for chunk in stream:
+            yield chunk
+    except genai_errors.APIError as e:
+        raise _raise_upstream(e) from e
+    except (LLMNotConfigured, LLMUpstreamError):
+        raise
+    except Exception as e:
+        raise LLMUpstreamError(f"Couldn't reach {LLM_PROVIDER}: {e}", 502) from e
 
 
 def chat_json(
@@ -114,33 +139,24 @@ def chat_json(
 ) -> dict:
     """One-shot completion forced into JSON mode. Returns the parsed object.
 
-    Retries up to `retries` times if the model returns unparseable JSON or omits
-    any of `require_keys` — a bad/partial call otherwise silently drops records.
-    Raises the last error if every attempt fails.
-    """
-    client = get_client()
+    Retries up to `retries` times if the model returns unparseable JSON or omits any of
+    `require_keys` — a bad/partial call otherwise silently drops records."""
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=temperature,
+        response_mime_type="application/json",
+    )
     last_error: Exception | None = None
-    for attempt in range(retries + 1):
-        resp = _complete(
-            client,
-            model=LLM_MODEL,
-            temperature=temperature,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        content = resp.choices[0].message.content or "{}"
+    for _ in range(retries + 1):
+        resp = generate(user, config)
+        content = (resp.text or "{}").strip()
         try:
             data = _parse_json_lenient(content)
         except (json.JSONDecodeError, ValueError) as e:
             last_error = e
             continue
         if require_keys and not all(k in data for k in require_keys):
-            last_error = ValueError(
-                f"response missing required keys {require_keys}; got {list(data)}"
-            )
+            last_error = ValueError(f"response missing required keys {require_keys}; got {list(data)}")
             continue
         return data
     raise last_error or ValueError("chat_json failed with no response")
@@ -148,30 +164,9 @@ def chat_json(
 
 def chat_text(system: str, user: str, temperature: float = 0.3) -> str:
     """One-shot completion returning free-form text (e.g. a drafted email)."""
-    client = get_client()
-    resp = _complete(
-        client,
-        model=LLM_MODEL,
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-
-def chat_raw(messages: list[dict], tools: list[dict] | None = None, temperature: float = 0.1):
-    """Raw chat completion, optionally with native tool definitions."""
-    client = get_client()
-    kwargs: dict = {
-        "model": LLM_MODEL,
-        "temperature": temperature,
-        "messages": messages,
-    }
-    if tools:
-        kwargs["tools"] = tools
-    return _complete(client, **kwargs)
+    config = types.GenerateContentConfig(system_instruction=system, temperature=temperature)
+    resp = generate(user, config)
+    return (resp.text or "").strip()
 
 
 def _parse_json_lenient(text: str) -> dict:

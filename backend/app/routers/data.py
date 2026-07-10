@@ -1,13 +1,13 @@
 from collections import defaultdict
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session, select
 
 from ..db import get_session
-from ..models import Bill, DocumentRecord, Source, Subscription, Transaction
+from ..models import Bill, DocumentRecord, InsightsCache, Source, Subscription, Transaction
 from ..services.actions import _monthly
-from ..services.insights import build_insights
+from ..services.insights import build_insights, regenerate_suggestions_bg
 
 router = APIRouter(prefix="/api", tags=["data"])
 
@@ -52,8 +52,15 @@ def get_source(source_id: int, session: Session = Depends(get_session)):
 
 
 @router.get("/insights")
-def get_insights(session: Session = Depends(get_session)):
-    return build_insights(session)
+def get_insights(background_tasks: BackgroundTasks, session: Session = Depends(get_session)):
+    # Cold cache → build_insights seeds instant rule-based suggestions; kick a one-off
+    # background LLM refresh so real suggestions appear on the next poll without ever
+    # blocking this request.
+    cold = session.get(InsightsCache, 1) is None
+    result = build_insights(session)
+    if cold:
+        background_tasks.add_task(regenerate_suggestions_bg)
+    return result
 
 
 @router.get("/stats")

@@ -34,9 +34,23 @@ def _compute_rule_based(session: Session):
     return subs, dupes, renewals, total_monthly
 
 
+def _write_cache(session: Session, suggestions: list[dict], llm_used: bool) -> InsightsCache:
+    cache = session.get(InsightsCache, 1)
+    if cache is None:
+        cache = InsightsCache(id=1)
+        session.add(cache)
+    cache.suggestions_json = json.dumps(suggestions)
+    cache.llm_used = llm_used
+    cache.updated_at = datetime.utcnow()
+    session.commit()
+    session.refresh(cache)
+    return cache
+
+
 def regenerate_suggestions(session: Session) -> InsightsCache:
     """Call the LLM for savings suggestions and persist them. Falls back to rule-based
-    suggestions when the LLM is unconfigured or fails. Call this on ingest — not on read."""
+    suggestions when the LLM is unconfigured or fails. This is the SLOW path (a live LLM
+    call) — run it on ingest or in a background task, never on the read path."""
     subs, dupes, renewals, total_monthly = _compute_rule_based(session)
     summary = {
         "total_monthly_subscription_cost": total_monthly,
@@ -56,27 +70,31 @@ def regenerate_suggestions(session: Session) -> InsightsCache:
     except (LLMNotConfigured, Exception):
         suggestions = _rule_based_suggestions(dupes, subs)
 
-    cache = session.get(InsightsCache, 1)
-    if cache is None:
-        cache = InsightsCache(id=1)
-        session.add(cache)
-    cache.suggestions_json = json.dumps(suggestions)
-    cache.llm_used = llm_used
-    cache.updated_at = datetime.utcnow()
-    session.commit()
-    session.refresh(cache)
-    return cache
+    return _write_cache(session, suggestions, llm_used)
+
+
+def regenerate_suggestions_bg() -> None:
+    """Background-task entrypoint. Opens its own DB session (the request's session is
+    already closed by the time a background task runs) and never raises."""
+    from ..db import engine
+
+    with Session(engine) as session:
+        try:
+            regenerate_suggestions(session)
+        except Exception:
+            pass
 
 
 def build_insights(session: Session) -> dict:
-    """Read path for GET /api/insights. Rule-based parts are recomputed fresh; the LLM
-    suggestions come from the cache. On a cold cache (first run) it generates once so the
-    user isn't left with an empty panel; the cache then survives restarts."""
+    """Read path for GET /api/insights — never calls the LLM, so it always returns fast.
+    Rule-based parts are recomputed fresh each request. LLM suggestions come from the
+    cache; on a cold cache we seed instant rule-based suggestions so the panel is never
+    empty, and the router schedules a one-off background LLM refresh."""
     subs, dupes, renewals, total_monthly = _compute_rule_based(session)
 
     cache = session.get(InsightsCache, 1)
     if cache is None:
-        cache = regenerate_suggestions(session)
+        cache = _write_cache(session, _rule_based_suggestions(dupes, subs), llm_used=False)
 
     return {
         "as_of": date.today().isoformat(),

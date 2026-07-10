@@ -17,7 +17,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = os.getenv(
     "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"
 )
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# gemini-2.5-flash is deprecated ("no longer available to new users"); default to 3.5-flash.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 # --- Unified LLM config (spec §3A.1) --------------------------------------------------
 # `LLM_PROVIDER` is first-class: gemini | fireworks | off (default off — the app runs
