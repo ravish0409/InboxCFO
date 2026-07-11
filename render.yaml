@@ -1,0 +1,55 @@
+# Render Blueprint — deploys Inbox CFO as two Docker web services.
+# In the Render dashboard: New + -> Blueprint -> pick this repo. Docs: https://render.com/docs/blueprint-spec
+#
+# Architecture (mirrors docker-compose.yml):
+#   inboxcfo-api  — FastAPI backend, listens on :8787, SQLite on a persistent disk
+#   inboxcfo-web  — nginx serving the built SPA, proxies /api to the backend over Render's
+#                   private network (services reach each other by name within a region)
+
+services:
+  # --- Backend API ---------------------------------------------------------------------
+  - type: web
+    name: inboxcfo-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    region: oregon            # keep both services in the SAME region for private networking
+    plan: starter             # a persistent disk requires a paid plan (not free)
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: data
+      mountPath: /data        # matches DB_PATH below — SQLite survives redeploys
+      sizeGB: 1
+    envVars:
+      # Fixed port so the frontend can reach us at a known private address.
+      - key: PORT
+        value: "8787"
+      - key: DB_PATH
+        value: /data/data.db
+      # Load demo data the first time the disk is empty (seed.py wipes, so it only runs once).
+      - key: SEED_ON_START
+        value: "1"
+      # --- LLM (optional — omit all three to run on seed data with chat disabled) ---
+      - key: LLM_PROVIDER
+        value: "off"          # set to "gemini" (or "fireworks") to enable the chat agent
+      - key: LLM_API_KEY
+        sync: false           # SECRET — set in the dashboard, never commit it
+      # - key: LLM_MODEL
+      #   value: gemini-3.5-flash
+
+  # --- Frontend (nginx serving the SPA + /api proxy) -----------------------------------
+  - type: web
+    name: inboxcfo-web
+    runtime: docker
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    region: oregon            # same region as the API (required for the private hostname)
+    plan: starter
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      # Where nginx proxies /api. `inboxcfo-api` resolves over Render's private network to
+      # the backend above, on the PORT we pinned to 8787.
+      - key: BACKEND_ORIGIN
+        value: http://inboxcfo-api:8787

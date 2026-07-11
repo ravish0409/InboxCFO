@@ -21,10 +21,13 @@ COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 
 # Where nginx proxies /api. Override to point the SPA at any backend (compose sets this
-# to the backend service; for a split deploy set it to your API's public URL).
+# to the backend service; on Render set it to the API's private URL).
 ENV BACKEND_ORIGIN=http://backend:8787
+# Port nginx listens on. Default 80 for local/compose; Render/Heroku inject their own PORT
+# at runtime and it takes precedence (the nginx entrypoint substitutes ${PORT} in the config).
+ENV PORT=80
 
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1
+    CMD wget -qO- "http://127.0.0.1:${PORT}/" >/dev/null 2>&1 || exit 1

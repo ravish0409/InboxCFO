@@ -42,6 +42,8 @@ SEED_ON_START=1 docker compose up --build
 Two containers (FastAPI backend + nginx-served frontend) wired by Compose; nginx proxies
 `/api` to the backend. Full instructions, env wiring, and split/cloud deploys: **[DEPLOY.md](DEPLOY.md)**.
 
+**Host it on Render** (one-click Blueprint via `render.yaml`): **[RENDER.md](RENDER.md)**.
+
 ## Quick start (offline demo, no keys needed)
 
 ```powershell

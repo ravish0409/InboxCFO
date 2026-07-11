@@ -1,7 +1,9 @@
 # Serves the built SPA and reverse-proxies the API. ${BACKEND_ORIGIN} is substituted
 # from the environment at container start (nginx envsubst on /etc/nginx/templates/*).
 server {
-    listen 80;
+    # ${PORT} is substituted at container start. Locally it defaults to 80 (Dockerfile
+    # ENV); on Render (and similar PaaS) the platform injects its own PORT and we honor it.
+    listen ${PORT};
     server_name _;
 
     root /usr/share/nginx/html;
