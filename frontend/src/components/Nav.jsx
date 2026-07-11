@@ -1,4 +1,6 @@
-import { Landmark, LayoutGrid, MessageSquareText, Repeat2, ShieldCheck } from 'lucide-react'
+import {
+  Landmark, LayoutGrid, MessageSquareText, PanelLeftClose, PanelLeftOpen, Repeat2, ShieldCheck,
+} from 'lucide-react'
 import { fmtTime } from '../api'
 import { focusRing } from '../ui'
 
@@ -31,11 +33,26 @@ function NavBadge({ count }) {
   )
 }
 
-export function Sidebar({ view, onNavigate, pendingCount, stats, busy, lastSync }) {
+export function Sidebar({ view, onNavigate, pendingCount, stats, busy, lastSync,
+                         collapsed, onToggleCollapse }) {
+  // Collapses to a slim icon-only rail (labels hidden, width narrowed) so a docked chat gets
+  // room; the header button toggles it. Nav stays clickable in both states. lg+ only —
+  // below lg the top MobileNav takes over.
   return (
-    <aside className="hidden lg:flex w-60 shrink-0 flex-col bg-card border-r border-line">
-      <div className="px-4 py-4 border-b border-line">
-        <Brand />
+    <aside className={`hidden lg:flex ${collapsed ? 'w-16' : 'w-60'} shrink-0 flex-col bg-card border-r border-line`}>
+      <div className={`py-4 border-b border-line flex items-center ${collapsed ? 'px-0 justify-center' : 'px-4 gap-2'}`}>
+        {!collapsed && <Brand />}
+        <button
+          onClick={onToggleCollapse}
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          aria-expanded={!collapsed}
+          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          className={`shrink-0 text-faint hover:text-ink hover:bg-inset rounded-md p-1.5 transition-colors duration-150 cursor-pointer ${focusRing} ${collapsed ? '' : 'ml-auto'}`}
+        >
+          {collapsed
+            ? <PanelLeftOpen size={16} strokeWidth={1.75} />
+            : <PanelLeftClose size={16} strokeWidth={1.75} />}
+        </button>
       </div>
 
       <nav className="px-3 py-3 space-y-1" aria-label="Main">
@@ -46,26 +63,35 @@ export function Sidebar({ view, onNavigate, pendingCount, stats, busy, lastSync 
               key={v.id}
               onClick={() => onNavigate(v.id)}
               aria-current={active ? 'page' : undefined}
-              className={`w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors duration-150 cursor-pointer ${focusRing} ${
+              title={v.label}
+              className={`w-full flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors duration-150 cursor-pointer ${focusRing} ${collapsed ? 'justify-center gap-0 px-0' : ''} ${
                 active ? 'bg-inset text-ink font-medium' : 'text-dim hover:text-ink hover:bg-inset/60'
               }`}
             >
-              <v.icon size={16} strokeWidth={1.75} className={active ? 'text-accent' : ''} />
-              {v.label}
-              {v.id === 'approvals' && <NavBadge count={pendingCount} />}
+              <span className="relative shrink-0">
+                <v.icon size={16} strokeWidth={1.75} className={active ? 'text-accent' : ''} />
+                {/* Collapsed rail: a dot stands in for the hidden count badge. */}
+                {collapsed && v.id === 'approvals' && pendingCount > 0 && (
+                  <span className="absolute -top-1 -right-1 w-1.5 h-1.5 rounded-full bg-alert" />
+                )}
+              </span>
+              {!collapsed && v.label}
+              {!collapsed && v.id === 'approvals' && <NavBadge count={pendingCount} />}
             </button>
           )
         })}
       </nav>
 
-      <div className="mt-auto px-4 py-4 border-t border-line space-y-1.5">
+      <div className={`mt-auto py-4 border-t border-line ${collapsed ? 'px-0 flex flex-col items-center' : 'px-4 space-y-1.5'}`}>
         <div className="flex items-center gap-2 text-xs text-dim">
           <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${busy ? 'bg-warn motion-safe:animate-pulse' : 'bg-gain'}`} />
-          <span className="truncate">{busy || 'Watching your inbox'}</span>
+          {!collapsed && <span className="truncate">{busy || 'Watching your inbox'}</span>}
         </div>
-        <div className="font-mono text-[11px] text-faint">
-          {stats?.items_ingested ?? 0} sources · last sync {lastSync ? fmtTime(lastSync) : '—'}
-        </div>
+        {!collapsed && (
+          <div className="font-mono text-[11px] text-faint">
+            {stats?.items_ingested ?? 0} sources · last sync {lastSync ? fmtTime(lastSync) : '—'}
+          </div>
+        )}
       </div>
     </aside>
   )

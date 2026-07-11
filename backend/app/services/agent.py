@@ -230,6 +230,43 @@ def draft_cancellation(session: Session, subscription_name: str = "") -> dict:
     return _draft(session, item.id)
 
 
+CHART_TYPES = {"bar", "line", "area", "pie", "stat"}
+
+
+def render_chart(session: Session, chart_type: str = "bar", title: str = "",
+                 unit: str = "", note: str = "", data: list | None = None) -> dict:
+    """Turn figures the agent already fetched into a chart the chat UI renders inline.
+
+    This tool does NOT query the DB — the agent passes the exact numbers it read from
+    the data tools. We validate + normalize into a compact spec; the streaming loop turns
+    a successful result into a `chart` SSE event (see stream_answer)."""
+    ct = (chart_type or "bar").lower().strip()
+    if ct not in CHART_TYPES:
+        ct = "bar"
+    points = []
+    for d in (data or []):
+        if not isinstance(d, dict):
+            continue
+        label = str(d.get("label", "")).strip()
+        try:
+            value = round(float(d.get("value")), 2)
+        except (TypeError, ValueError):
+            continue  # skip points without a real number rather than plot a hole
+        point = {"label": label, "value": value}
+        if d.get("currency"):
+            point["currency"] = str(d["currency"]).upper()
+        points.append(point)
+    if not points:
+        return {"error": "render_chart needs at least one data point with a numeric value"}
+    return {"ok": True, "chart": {
+        "type": ct,
+        "title": (title or "").strip(),
+        "unit": (unit or "").upper().strip(),  # currency code → money-formatted; else plain
+        "note": (note or "").strip(),
+        "data": points,
+    }}
+
+
 TOOL_FUNCS = {
     "total_spend": total_spend,
     "spend_by_category": spend_by_category,
@@ -240,6 +277,7 @@ TOOL_FUNCS = {
     "find_documents": find_documents,
     "list_action_items": list_action_items,
     "draft_cancellation": draft_cancellation,
+    "render_chart": render_chart,
 }
 
 TOOL_SCHEMAS = [
@@ -294,6 +332,29 @@ TOOL_SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "subscription_name": {"type": "string", "description": "the service to cancel, e.g. 'Audible'"}},
             "required": ["subscription_name"]}}},
+    {"type": "function", "function": {
+        "name": "render_chart",
+        "description": (
+            "Draw a chart in the chat so the user can SEE the data, not just read it. "
+            "Call this AFTER a data tool has returned the numbers, whenever a comparison, "
+            "breakdown, trend or share-of-total would land better visually — e.g. spend by "
+            "category or merchant (bar), spend across months (line/area), a subscription mix "
+            "(pie), or one headline figure (stat). Pass the EXACT values from the tool results "
+            "(never invent numbers). After calling it, still give your short written answer — "
+            "the chart complements the text, it doesn't replace it. Skip it for single-fact "
+            "answers where a number in a sentence is clearer."),
+        "parameters": {"type": "object", "properties": {
+            "chart_type": {"type": "string", "description": "bar (compare categories/merchants), line or area (trend over time), pie (share of a whole), or stat (one big headline number)"},
+            "title": {"type": "string", "description": "short chart title, e.g. 'Spend by category — June'"},
+            "unit": {"type": "string", "description": "currency code (INR, USD, …) when the values are money — formats axes and labels with the currency symbol. Omit for plain counts."},
+            "note": {"type": "string", "description": "optional one-line caption shown under the chart"},
+            "data": {"type": "array", "description": "the points to plot, in display order (use ONE point for a stat)",
+                     "items": {"type": "object", "properties": {
+                         "label": {"type": "string", "description": "category / merchant / month / etc."},
+                         "value": {"type": "number", "description": "the numeric value for this point"},
+                         "currency": {"type": "string", "description": "optional per-point currency code, if it differs from unit"}},
+                         "required": ["label", "value"]}}},
+            "required": ["chart_type", "data"]}}},
 ]
 
 SYSTEM_PROMPT = """You are "Inbox CFO", a personal finance assistant. You answer questions about the user's
@@ -312,6 +373,10 @@ Rules:
   If it surfaces a free trial ending or a duplicate, proactively OFFER to draft a cancellation.
 - When the user asks to cancel something (or accepts your offer), call draft_cancellation with the name.
   You draft the email for their approval — you never send it. Tell them it's a draft to review and send.
+- When your answer compares several amounts, breaks spending down, shows a trend over months, or
+  covers a share of a whole, call render_chart with the exact figures to draw it inline — a bar chart
+  for category/merchant breakdowns, line/area for month-over-month trends, pie for a mix, stat for a
+  single headline number. Still write your short text answer alongside it. Don't chart a single plain fact.
 - If a tool returns nothing relevant, say you couldn't find it in the ingested data.
 
 Formatting: reply in GitHub-flavored Markdown. Put money amounts and service names in **bold**
@@ -421,12 +486,15 @@ def answer_question(session: Session, question: str, history: list[dict] | None 
     contents = _to_contents(question, history)
     sources: list[dict] = []
     trace: list[dict] = []
+    charts: list[dict] = []
+    actions: list[dict] = []
 
     for _ in range(MAX_TURNS):
         resp = generate(contents, config)
         calls = resp.function_calls or []
         if not calls:
-            return {"answer": resp.text or "", "sources": sources, "tool_trace": trace}
+            return {"answer": resp.text or "", "sources": sources,
+                    "tool_trace": trace, "charts": charts, "actions": actions}
 
         contents.append(resp.candidates[0].content)  # the model's function-call turn
         response_parts = []
@@ -434,6 +502,10 @@ def answer_question(session: Session, question: str, history: list[dict] | None 
         for fc in calls:
             args = dict(fc.args or {})
             result = _run_tool(session, fc.name, args)
+            if isinstance(result, dict) and result.get("chart"):
+                charts.append(result["chart"])
+            if fc.name == "draft_cancellation" and isinstance(result, dict) and not result.get("error"):
+                actions.append(result)
             _collect_sources(result, turn_acc)
             trace.append({"tool": fc.name, "args": args})
             response_parts.append(_tool_response_part(fc.name, result))
@@ -442,12 +514,13 @@ def answer_question(session: Session, question: str, history: list[dict] | None 
         contents.append(types.Content(role="user", parts=response_parts))
 
     return {"answer": "I couldn't complete that within my step limit — try a simpler question.",
-            "sources": sources, "tool_trace": trace}
+            "sources": sources, "tool_trace": trace, "charts": charts, "actions": actions}
 
 
 def stream_answer(session: Session, question: str, history: list[dict] | None = None):
     """Generator yielding SSE-shaped events for the chat stream:
       {"type": "tool", "tool": <name>}     — a tool step, as it happens
+      {"type": "chart", "chart": {...}}    — a chart to render inline, when render_chart runs
       {"type": "token", "text": <chunk>}   — a fragment of the final answer
       {"type": "sources", "sources": [...]}— evidence, once at the end
 
@@ -492,6 +565,10 @@ def stream_answer(session: Session, question: str, history: list[dict] | None = 
         for name, args in exec_calls:
             yield {"type": "tool", "tool": name}
             result = _run_tool(session, name, args)
+            if isinstance(result, dict) and result.get("chart"):
+                yield {"type": "chart", "chart": result["chart"]}
+            if name == "draft_cancellation" and isinstance(result, dict) and not result.get("error"):
+                yield {"type": "action", "action": result}
             _collect_sources(result, turn_acc)
             response_parts.append(_tool_response_part(name, result))
         if turn_acc:  # keep the latest data-bearing turn; exploratory earlier calls don't cite

@@ -16,6 +16,8 @@ class MessageIn(BaseModel):
     content: str = ""
     trace: list[dict] = []
     sources: list[dict] = []
+    charts: list[dict] = []
+    actions: list[dict] = []
     error: bool = False
 
 
@@ -46,6 +48,8 @@ def _message_out(m: ChatMessage) -> dict:
         "content": m.content,
         "trace": json.loads(m.trace_json or "[]"),
         "sources": json.loads(m.sources_json or "[]"),
+        "charts": json.loads(m.charts_json or "[]"),
+        "actions": json.loads(m.actions_json or "[]"),
         "error": m.error,
     }
 
@@ -70,6 +74,8 @@ def _replace_messages(session: Session, conv: Conversation, messages: list[Messa
             content=m.content,
             trace_json=json.dumps(m.trace),
             sources_json=json.dumps(m.sources),
+            charts_json=json.dumps(m.charts),
+            actions_json=json.dumps(m.actions),
             error=m.error,
         ))
     conv.title = _title_from(messages)

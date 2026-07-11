@@ -92,6 +92,9 @@ export default function App() {
   const [chatOpen, setChatOpen] = useState(
     () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1280px)').matches,
   )
+  // The sidebar collapses to an icon rail to give the docked chat room. Auto-collapses
+  // when the chat opens, but the user can override with the sidebar's expand/collapse button.
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(chatOpen)
   const fileRef = useRef(null)
   const jobCounter = useRef(0)
   const jobAbort = useRef(null)   // AbortController for the in-flight sync/upload stream
@@ -109,6 +112,10 @@ export default function App() {
 
   useEffect(() => { refresh() }, [refresh])
 
+  // Opening the chat collapses the sidebar to a rail; closing it restores the full nav.
+  // (The manual toggle overrides this until the chat is next toggled.)
+  useEffect(() => { setSidebarCollapsed(chatOpen) }, [chatOpen])
+
   // Keep the current view in the URL hash so a refresh lands on the same page.
   useEffect(() => {
     window.history.replaceState(null, '', `#${view}`)
@@ -124,6 +131,14 @@ export default function App() {
   // and the handler below detects the aborted signal to mark the job as stopped.
   function handleStopJob() {
     jobAbort.current?.abort()
+  }
+
+  // Sidebar/chat compete for width: expanding the full sidebar minimizes the chat, so the
+  // two never fight for room. Collapsing back to the rail leaves the chat as-is.
+  function handleToggleSidebar() {
+    const expanding = sidebarCollapsed
+    setSidebarCollapsed(!sidebarCollapsed)
+    if (expanding) setChatOpen(false)
   }
 
   async function handleSync() {
@@ -186,9 +201,10 @@ export default function App() {
   return (
     <div className="h-screen flex flex-col lg:flex-row overflow-hidden">
       <MobileNav view={view} onNavigate={setView} pendingCount={pending.length}
-                 chatOpen={chatOpen} onToggleChat={() => setChatOpen((o) => !o)} />
+        chatOpen={chatOpen} onToggleChat={() => setChatOpen((o) => !o)} />
       <Sidebar view={view} onNavigate={setView} pendingCount={pending.length}
-               stats={stats} busy={busy} lastSync={lastSync} />
+        stats={stats} busy={busy} lastSync={lastSync}
+        collapsed={sidebarCollapsed} onToggleCollapse={() => setSidebarCollapsed((c) => !c)} />
 
       <main className="flex-1 min-w-0 flex flex-col min-h-0">
         <header className="shrink-0 bg-card border-b border-line px-4 lg:px-6 py-3 flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -208,9 +224,8 @@ export default function App() {
             onClick={() => setChatOpen((o) => !o)}
             aria-pressed={chatOpen}
             aria-label="Toggle assistant"
-            className={`hidden lg:inline-flex items-center justify-center p-2 rounded-lg border transition-colors duration-150 cursor-pointer ${focusRing} ${
-              chatOpen ? 'border-accent text-accent bg-accent-soft' : 'border-line-strong text-dim hover:text-ink hover:bg-inset'
-            }`}
+            className={`hidden lg:inline-flex items-center justify-center p-2 rounded-lg border transition-colors duration-150 cursor-pointer ${focusRing} ${chatOpen ? 'border-accent text-accent bg-accent-soft' : 'border-line-strong text-dim hover:text-ink hover:bg-inset'
+              }`}
           >
             <MessageSquareText size={16} strokeWidth={1.75} />
           </button>
@@ -234,7 +249,7 @@ export default function App() {
 
             {view === 'approvals' && (
               <ActionCenter items={actionItems} onShowSource={setSourceId}
-                            onRefresh={refresh} onBusy={setBusy} />
+                onRefresh={refresh} onBusy={setBusy} />
             )}
 
             {view === 'subscriptions' && (
@@ -250,7 +265,7 @@ export default function App() {
       {chatOpen && (
         <>
           <div className="fixed inset-0 bg-black/30 z-30 xl:hidden" onClick={() => setChatOpen(false)} />
-          <aside className="fixed inset-y-0 right-0 z-40 w-full max-w-md bg-card border-l border-line shadow-2xl flex flex-col min-h-0 xl:static xl:z-auto xl:w-[380px] xl:max-w-none xl:shrink-0 xl:shadow-none">
+          <aside className="fixed inset-y-0 right-0 z-40 w-full max-w-lg bg-card border-l border-line shadow-2xl flex flex-col min-h-0 xl:static xl:z-auto xl:w-[540px] 2xl:w-[560px] xl:max-w-none xl:shrink-0 xl:shadow-none">
             <Chat onShowSource={setSourceId} onBusy={setBusy} onClose={() => setChatOpen(false)} />
           </aside>
         </>

@@ -22,6 +22,10 @@ _ADDED_COLUMNS = {
     },
     "bill": {"norm_key": "VARCHAR NOT NULL DEFAULT ''"},
     "transaction": {"dedup_key": "VARCHAR NOT NULL DEFAULT ''"},
+    "chatmessage": {
+        "charts_json": "VARCHAR NOT NULL DEFAULT '[]'",
+        "actions_json": "VARCHAR NOT NULL DEFAULT '[]'",
+    },
 }
 
 

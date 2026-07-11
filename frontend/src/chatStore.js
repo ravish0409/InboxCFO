@@ -9,12 +9,14 @@ import { api } from './api'
 // and the empty assistant placeholder shown mid-stream is dropped.
 const persistable = (messages) =>
   messages
-    .filter((m) => m.content || m.error)
-    .map(({ role, content, trace, sources, error }) => ({
+    .filter((m) => m.content || m.error || m.charts?.length || m.actions?.length)
+    .map(({ role, content, trace, sources, charts, actions, error }) => ({
       role,
       content: content || '',
       trace: trace || [],
       sources: sources || [],
+      charts: charts || [],
+      actions: actions || [],
       error: !!error,
     }))
 

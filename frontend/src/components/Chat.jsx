@@ -1,16 +1,22 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bot, History, SendHorizonal, SquarePen, Trash2, X } from 'lucide-react'
+import {
+  ArrowUpRight, BellRing, Bot, CalendarClock, Copy, History, IndianRupee,
+  Receipt, Scissors, SendHorizonal, SquarePen, Trash2, X,
+} from 'lucide-react'
 import { api, fmtRel } from '../api'
 import { useChatSessions } from '../chatStore'
 import { EvidenceChip } from './Evidence'
 import { Markdown } from './Markdown'
-import { focusRing } from '../ui'
+import { ChatChart } from './ChatChart'
+import { btn, focusRing } from '../ui'
 
+// Each starter carries a lucide icon and a short category so the empty state reads
+// as a set of capabilities, not a plain list of strings.
 const SUGGESTIONS = [
-  'When does my car insurance expire?',
-  'How much did I spend on Swiggy last month?',
-  'Am I paying for duplicate subscriptions?',
-  "What's due in the next two weeks?",
+  { icon: CalendarClock, tag: 'Renewals', text: 'When does my car insurance expire?' },
+  { icon: Receipt, tag: 'Spending', text: 'How much did I spend on Swiggy last month?' },
+  { icon: Copy, tag: 'Waste', text: 'Am I paying for duplicate subscriptions?' },
+  { icon: BellRing, tag: 'Upcoming', text: "What's due in the next two weeks?" },
 ]
 
 // Turn raw tool names into the agent's own account of what it did.
@@ -24,6 +30,7 @@ const TOOL_LABEL = {
   find_documents: 'searched documents',
   list_action_items: 'reviewed open traps',
   draft_cancellation: 'drafted cancellation',
+  render_chart: 'drew a chart',
 }
 const toolLabel = (t) => TOOL_LABEL[t] || t.replace(/_/g, ' ')
 
@@ -53,6 +60,58 @@ function TypingDots() {
           style={{ animationDelay: `${i * 150}ms` }} />
       ))}
     </span>
+  )
+}
+
+// An actionable cancellation draft the agent produced in chat — mirrors the Action
+// Center's approve/copy controls so the user can act without switching tabs. The draft
+// text itself is already in the message; this is just the button row.
+function CancelActionCard({ action }) {
+  const [approving, setApproving] = useState(false)
+  const [approved, setApproved] = useState(false)
+  const [copied, setCopied] = useState(false)
+
+  async function approve() {
+    setApproving(true)
+    try {
+      if (action.id != null) await api.approveAction(action.id)
+      setApproved(true)
+      if (action.mailto) window.location.href = action.mailto  // opens the mail client
+    } catch (e) {
+      console.error(e)
+    } finally {
+      setApproving(false)
+    }
+  }
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(action.draft_text || '')
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch { /* clipboard may be blocked; the draft is still selectable above */ }
+  }
+
+  return (
+    <div className="mt-2.5 rounded-xl border border-line bg-card p-2.5">
+      <div className="flex items-center gap-1.5 mb-2 text-[11px] font-medium text-dim">
+        <Scissors size={12} strokeWidth={1.75} className="text-accent" />
+        Cancel {action.subscription}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <button onClick={approve} disabled={approving || approved} className={btn.primarySm}>
+          {approved ? 'Approved ✓' : approving ? 'Opening…' : 'Approve & open email'}
+        </button>
+        <button onClick={copy} className={btn.secondarySm}>
+          {copied ? 'Copied' : 'Copy draft'}
+        </button>
+        {action.cancel_url && (
+          <a href={action.cancel_url} target="_blank" rel="noreferrer" className={btn.secondarySm}>
+            Cancellation page ↗
+          </a>
+        )}
+      </div>
+    </div>
   )
 }
 
@@ -170,6 +229,8 @@ export function Chat({ onShowSource, onBusy, onClose }) {
       await api.chatStream(question, history, {
         onTool: (tool) => patch((a) => ({ ...a, trace: [...(a.trace || []), { tool }] })),
         onToken: (text) => patch((a) => ({ ...a, content: (a.content || '') + text })),
+        onChart: (chart) => patch((a) => ({ ...a, charts: [...(a.charts || []), chart] })),
+        onAction: (action) => patch((a) => ({ ...a, actions: [...(a.actions || []), action] })),
         onSources: (sources) => patch((a) => ({ ...a, sources })),
         // A mid-stream server error: keep whatever streamed, otherwise show the reason.
         onError: (message) =>
@@ -243,16 +304,47 @@ export function Chat({ onShowSource, onBusy, onClose }) {
 
           <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
             {!messages.length && (
-              <div className="space-y-2">
-                <p className="text-sm text-dim mb-3">
-                  Ask anything about your subscriptions, bills, or spending — answers come from your ingested emails.
+              <div className="h-full flex flex-col justify-center py-6">
+                {/* Identity + greeting — the assistant introduces itself before any turn. */}
+                <div className="text-center mb-7 fade-in">
+                  <span className="relative inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-accent-soft text-accent mb-4 ring-1 ring-accent/15">
+                    <Bot size={26} strokeWidth={1.75} />
+                    <span className="absolute -top-1.5 -right-1.5 flex items-center justify-center w-5 h-5 rounded-full bg-accent text-white ring-2 ring-card motion-safe:animate-pulse">
+                      <IndianRupee size={11} strokeWidth={2.25} />
+                    </span>
+                  </span>
+                  <h2 className="text-lg font-semibold text-ink">Your money, answered.</h2>
+                  <p className="text-sm text-dim mt-1.5 max-w-[16rem] mx-auto leading-relaxed">
+                    Ask about subscriptions, bills, or spending — every answer cites the emails it came from.
+                  </p>
+                </div>
+
+                <p className="text-[11px] font-medium uppercase tracking-wide text-faint px-1 mb-2">
+                  Try asking
                 </p>
-                {SUGGESTIONS.map((s) => (
-                  <button key={s} onClick={() => ask(s)}
-                    className={`block w-full text-left text-sm text-dim bg-card border border-line rounded-lg px-3 py-2 transition-colors duration-150 hover:border-line-strong hover:text-ink cursor-pointer ${focusRing}`}>
-                    {s}
-                  </button>
-                ))}
+                <div className="space-y-2">
+                  {SUGGESTIONS.map((s, i) => (
+                    <button
+                      key={s.text}
+                      onClick={() => ask(s.text)}
+                      style={{ animationDelay: `${i * 60}ms`, animationFillMode: 'backwards' }}
+                      className={`fade-in group flex w-full items-center gap-3 text-left bg-card border border-line rounded-xl px-3 py-2.5 transition-all duration-150 hover:border-accent/40 hover:bg-accent-soft/40 cursor-pointer ${focusRing}`}
+                    >
+                      <span className="shrink-0 flex items-center justify-center w-8 h-8 rounded-lg bg-inset text-dim transition-colors duration-150 group-hover:bg-accent-soft group-hover:text-accent">
+                        <s.icon size={16} strokeWidth={1.75} />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[10px] font-medium uppercase tracking-wide text-faint">{s.tag}</span>
+                        <span className="block text-sm text-dim leading-snug group-hover:text-ink transition-colors duration-150">{s.text}</span>
+                      </span>
+                      <ArrowUpRight
+                        size={15}
+                        strokeWidth={1.75}
+                        className="shrink-0 text-faint opacity-0 -translate-x-1 transition-all duration-150 group-hover:opacity-100 group-hover:translate-x-0 group-hover:text-accent"
+                      />
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
 
@@ -272,8 +364,14 @@ export function Chat({ onShowSource, onBusy, onClose }) {
                       {isAssistant && !m.error
                         ? (m.content
                           ? <Markdown>{m.content}</Markdown>
-                          : m.streaming && <TypingDots />)
+                          : m.streaming && !m.charts?.length && !m.actions?.length && <TypingDots />)
                         : m.content}
+                      {isAssistant && !m.error && m.charts?.map((chart, ci) => (
+                        <ChatChart key={ci} chart={chart} />
+                      ))}
+                      {isAssistant && !m.error && m.actions?.map((action, ai) => (
+                        <CancelActionCard key={ai} action={action} />
+                      ))}
                       {!!m.sources?.length && (
                         <div className="mt-2 pt-2 border-t border-line-strong/40 flex flex-wrap gap-1.5">
                           {m.sources.slice(0, 4).map((s) => (

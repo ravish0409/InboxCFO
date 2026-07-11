@@ -129,7 +129,7 @@ async function postSSE(url, options = {}, onEvent) {
 }
 
 // POST to the SSE chat endpoint and dispatch events as they arrive.
-// handlers: { onToken(text), onTool(name), onSources(list), onError(message) }.
+// handlers: { onToken(text), onTool(name), onChart(spec), onAction(item), onSources(list), onError(message) }.
 // Resolves when the stream closes (a `done` event or the body ending).
 function streamChat(question, history, handlers = {}) {
   return postSSE(
@@ -142,6 +142,8 @@ function streamChat(question, history, handlers = {}) {
     (event) => {
       if (event.type === 'token') handlers.onToken?.(event.text)
       else if (event.type === 'tool') handlers.onTool?.(event.tool)
+      else if (event.type === 'chart') handlers.onChart?.(event.chart)
+      else if (event.type === 'action') handlers.onAction?.(event.action)
       else if (event.type === 'sources') handlers.onSources?.(event.sources || [])
       else if (event.type === 'error') handlers.onError?.(event.message)
     },

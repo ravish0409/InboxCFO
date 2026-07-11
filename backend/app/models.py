@@ -111,6 +111,8 @@ class ChatMessage(SQLModel, table=True):
     content: str = ""
     trace_json: str = "[]"  # JSON-encoded list[{"tool": str}]
     sources_json: str = "[]"  # JSON-encoded list[dict]
+    charts_json: str = "[]"  # JSON-encoded list[dict] — inline charts the agent drew
+    actions_json: str = "[]"  # JSON-encoded list[dict] — cancellation drafts to approve inline
     error: bool = False
 
 
