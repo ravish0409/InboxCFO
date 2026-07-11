@@ -1,0 +1,27 @@
+# Root build context for the combined Dockerfile. Keep secrets, local state, and heavy
+# dirs out of the image.
+
+# Secrets & local data — never bake into the image
+backend/.env
+backend/credentials.json
+backend/client_secret*.json
+backend/token.json
+backend/data.db
+**/*.db
+
+# Deps / build output (rebuilt inside the image)
+**/node_modules
+frontend/dist
+backend/.venv
+
+# Python cruft
+**/__pycache__
+**/*.pyc
+
+# VCS / editor / docker meta
+.git
+.qa_tmp
+**/.DS_Store
+Dockerfile
+.dockerignore
+docker-compose.yml

@@ -1,135 +1,112 @@
 # Deploying Inbox CFO on Render
 
-Two Docker web services, wired the same way as `docker-compose.yml`:
+**One** Docker web service. The FastAPI backend serves both the API and the built React
+app on the same origin — so there's no `/api` proxy, no second service, and no 502s from
+cross-service wiring. This is the recommended way to host it.
 
-- **`inboxcfo-api`** — FastAPI backend on `:8787`, SQLite on a persistent disk.
-- **`inboxcfo-web`** — nginx serving the built React app, proxying `/api` to the backend
-  over Render's private network. This preserves SSE streaming (chat/sync/upload), which is
-  why we use an nginx web service rather than a static site.
-
-There are two ways to deploy: the **Blueprint** (one click, uses `render.yaml`) or **manual**
-(create each service in the dashboard). The Blueprint is recommended.
+> The combined image is built by the `Dockerfile` at the **repo root** (a multi-stage build:
+> Node compiles the frontend, then it's baked into the Python image and served by FastAPI).
 
 ---
 
-## Prerequisites
+## Fix an existing (broken) service
 
-1. Push this repo to GitHub/GitLab (Render deploys from a connected repo).
-2. A Render account → https://dashboard.render.com
-3. A paid instance type (**Starter**, ~$7/mo per service) if you want the SQLite data to
-   **persist** — persistent disks aren't available on the free plan. See *Free-tier option* below.
+If you already have a service (e.g. `inboxcfo-frontend`) that 502s on `/api/*`, it's the
+old frontend-only container with no backend. Point it at the combined image instead:
+
+Open the service → **Settings**:
+- **Dockerfile Path**: `./Dockerfile`   ← the root one, not `./frontend/Dockerfile`
+- **Docker Build Context Directory**: `.`
+- **Health Check Path**: `/api/health`
+- Remove any `BACKEND_ORIGIN` env var (no longer used).
+- (Optional, for persistent data) add a **Disk**: mount path `/data`, 1 GB — requires a paid plan.
+- Add env vars: `DB_PATH=/data/data.db`, `SEED_ON_START=1` (see LLM vars below).
+
+Then **Manual Deploy → Clear build cache & deploy**. When it's Live, the same URL serves the
+app *and* the API. (You can delete any leftover separate backend service.)
 
 ---
 
-## Option A — Blueprint (recommended)
+## Fresh deploy — Blueprint (easiest)
 
-1. Commit `render.yaml` (already at the repo root) and push.
+1. Commit `render.yaml` and `Dockerfile` (both at the repo root) and push.
 2. Render dashboard → **New +** → **Blueprint** → select this repo → **Apply**.
-   Render reads `render.yaml` and creates both services + the disk.
-3. Set the secret env var: open **inboxcfo-api** → **Environment** →
-   - To enable the chat agent: set `LLM_PROVIDER=gemini` and paste your key into `LLM_API_KEY`
-     (get one at https://aistudio.google.com/apikey). Leave `LLM_PROVIDER=off` to skip.
-4. Wait for both services to go **Live**. Open the **inboxcfo-web** URL
-   (`https://inboxcfo-web.onrender.com`). Done.
-
-The first backend boot seeds demo data (`SEED_ON_START=1`) because the disk starts empty.
+   It creates one web service named `inboxcfo` with a persistent disk.
+3. (Optional) enable chat: open the service → **Environment** → set `LLM_PROVIDER=gemini`
+   and paste your key into `LLM_API_KEY` (get one at https://aistudio.google.com/apikey).
+4. Wait for **Live**, then open the service URL. First boot seeds demo data.
 
 ---
 
-## Option B — Manual (dashboard, no Blueprint)
+## Fresh deploy — manual (no Blueprint)
 
-### 1. Backend service
-
-**New +** → **Web Service** → connect repo, then:
+**New +** → **Web Service** → connect this repo, then:
 
 | Field | Value |
 |---|---|
 | Language / Runtime | **Docker** |
-| Dockerfile Path | `./backend/Dockerfile` |
-| Docker Build Context Directory | `./backend` |
-| Region | e.g. **Oregon** (remember it) |
-| Instance Type | **Starter** (needed for a disk) |
+| Dockerfile Path | `./Dockerfile` |
+| Docker Build Context Directory | `.` |
+| Instance Type | **Starter** (needed for the disk) or **Free** (see below) |
 | Health Check Path | `/api/health` |
 
-**Advanced → Environment Variables:**
+**Environment Variables:**
 ```
-PORT           = 8787
 DB_PATH        = /data/data.db
 SEED_ON_START  = 1
 LLM_PROVIDER   = off          # or "gemini" to enable chat
 LLM_API_KEY    = <your key>   # only if LLM_PROVIDER != off; mark as secret
 ```
+Do **not** set `PORT` — Render injects it and the app binds to it automatically.
 
-**Advanced → Disks → Add Disk:**
-```
-Name       = data
-Mount Path = /data
-Size       = 1 GB
-```
+**Disks → Add Disk** (for persistent data): name `data`, mount path `/data`, size `1 GB`.
 
-Create the service. Note its **name** (e.g. `inboxcfo-api`).
-
-### 2. Frontend service
-
-**New +** → **Web Service** → same repo:
-
-| Field | Value |
-|---|---|
-| Language / Runtime | **Docker** |
-| Dockerfile Path | `./frontend/Dockerfile` |
-| Docker Build Context Directory | `./frontend` |
-| Region | **same region as the backend** (required for private networking) |
-| Instance Type | Starter (or Free — the frontend needs no disk) |
-| Health Check Path | `/` |
-
-**Environment Variables:**
-```
-BACKEND_ORIGIN = http://inboxcfo-api:8787
-```
-Use the backend's exact service name and the port you set (`8787`). Render resolves
-`inboxcfo-api` to the backend over the private network. **Don't** set `PORT` here — let
-Render inject its own; the nginx config picks it up automatically.
-
-Open the frontend's public URL when it's Live.
+Create the service and open its URL when Live.
 
 ---
 
 ## Free-tier option (no persistent data)
 
 Free web services can't have a disk, so SQLite lives on ephemeral storage and **resets on
-every deploy/restart** (and free services spin down after ~15 min idle). Fine for a demo:
+every deploy/restart** (free services also sleep after ~15 min idle). Fine for a demo:
 
-- Backend: Instance Type **Free**, **no disk**, set `DB_PATH=/tmp/data.db` and keep
-  `SEED_ON_START=1` so it reseeds demo data on each cold start.
-- Frontend: Instance Type **Free**.
-- Everything else is identical.
-
-To use the free tier via the Blueprint, edit `render.yaml`: change both `plan: starter` to
-`plan: free`, remove the `disk:` block, and set `DB_PATH` to `/tmp/data.db`.
+- Instance Type **Free**, **no disk**, set `DB_PATH=/tmp/data.db`, keep `SEED_ON_START=1`
+  so demo data reloads on each cold start.
+- Via the Blueprint: edit `render.yaml` → change `plan: starter` to `plan: free`, delete the
+  `disk:` block, and set `DB_PATH` to `/tmp/data.db`.
 
 ---
 
-## Verifying the deploy
+## Verify
 
 ```bash
-curl https://inboxcfo-web.onrender.com/api/health      # -> {"ok":true}
-curl https://inboxcfo-web.onrender.com/api/stats       # -> dashboard JSON
+curl https://<your-service>.onrender.com/api/health     # {"ok":true}
+curl https://<your-service>.onrender.com/api/stats      # dashboard JSON
 ```
-Then open the frontend URL — the dashboard, duplicate warnings, renewals, and spend chart
-should render. If you set an LLM key, the chat agent answers questions too.
+Then open the URL — dashboard, duplicate warnings, renewals, and the spend chart render.
+With an LLM key set, the chat agent answers too.
 
 ---
 
 ## Gotchas
 
-- **Same region** for both services, or the private hostname `inboxcfo-api` won't resolve.
-- **Secrets**: `LLM_API_KEY` is marked `sync: false` in the blueprint — set it in the
-  dashboard; never commit it. `.env`, `credentials.json`, `token.json` are gitignored and
-  `.dockerignore`d, so they never reach the image.
+- **Secrets** never enter the image — `.env`, `credentials.json`, `token.json`, `*.db` are
+  gitignored and in `.dockerignore`. Set `LLM_API_KEY` in the dashboard (`sync: false`).
 - **Gmail sync won't work on Render** — it needs an interactive desktop OAuth consent flow
-  that can't complete headlessly. The LLM chat, file upload, dashboard, and seed data are
-  unaffected. (To support it you'd mount a pre-authorized `token.json`, which is out of
-  scope for a hosted demo.)
+  that can't complete headlessly. Chat, file upload, dashboard, and seed data are unaffected.
 - **Cold starts**: free services sleep when idle; the first request after a sleep takes
-  ~30–60s to wake. Starter plans stay warm.
-- **SQLite = single instance.** Don't scale the backend past 1 instance against one disk.
+  ~30–60s. Starter plans stay warm.
+- **SQLite = single instance.** Don't scale past 1 instance against one disk.
+
+---
+
+## Local dev is unchanged
+
+`docker compose up --build` still runs the two-container setup (nginx + backend) for local
+development — see [DEPLOY.md](DEPLOY.md). The single-container `Dockerfile` is specifically
+for a one-service host like Render; you can also run it directly:
+
+```bash
+docker build -t inboxcfo .
+docker run -p 8787:8787 -e SEED_ON_START=1 inboxcfo   # http://localhost:8787
+```
