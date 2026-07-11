@@ -1,0 +1,40 @@
+# Inbox CFO — full stack. `docker compose up --build` then open http://localhost:8080
+#
+# Endpoint wiring lives in .env (copy .env.example -> .env):
+#   - the frontend (nginx) proxies /api to the `backend` service via BACKEND_ORIGIN
+#   - the backend reads its LLM / Gmail / DB config from backend/.env
+
+services:
+  backend:
+    build: ./backend
+    # LLM keys, Gmail config, DB_PATH override, etc. live here (copy backend/.env.example).
+    # Optional: with no .env the app still runs fully on seed data (LLM_PROVIDER=off).
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      # DB lives on the named volume so ingested data survives rebuilds.
+      DB_PATH: /data/data.db
+      # Set SEED_ON_START=1 to load demo data the first time the volume is empty.
+      SEED_ON_START: ${SEED_ON_START:-0}
+    volumes:
+      - backend_data:/data
+    # Not published to the host by default — only the frontend reaches it, over the
+    # internal network. Uncomment to hit the API directly for debugging.
+    # ports:
+    #   - "8787:8787"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    environment:
+      # Where nginx forwards /api. Points at the backend service on the compose network.
+      BACKEND_ORIGIN: ${BACKEND_ORIGIN:-http://backend:8787}
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend_data:

@@ -31,6 +31,17 @@ SQLite: subscriptions · bills · transactions · documents
 the agent answers by calling tools over structured tables, so *"how much did I spend"* returns a
 real SQL sum — not an LLM guess. Every number in the UI links back to its source email (click `src`).
 
+## Deploy with Docker
+
+```bash
+docker compose up --build            # open http://localhost:8080
+# demo data on first boot:
+SEED_ON_START=1 docker compose up --build
+```
+
+Two containers (FastAPI backend + nginx-served frontend) wired by Compose; nginx proxies
+`/api` to the backend. Full instructions, env wiring, and split/cloud deploys: **[DEPLOY.md](DEPLOY.md)**.
+
 ## Quick start (offline demo, no keys needed)
 
 ```powershell

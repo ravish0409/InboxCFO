@@ -1,0 +1,16 @@
+# Secrets & local state — never bake these into the image
+.env
+credentials.json
+client_secret*.json
+token.json
+data.db
+*.db
+
+# Python cruft
+.venv/
+__pycache__/
+*.pyc
+
+# Docker files themselves
+Dockerfile
+.dockerignore
