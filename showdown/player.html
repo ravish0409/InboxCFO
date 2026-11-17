@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>showdown player</title>
+    <style>
+      @font-face { font-family: "Archivo"; font-style: normal; font-weight: 100 900; font-stretch: 62% 125%; src: url("engine/fonts/Archivo.ttf") format("truetype"); }
+      html, body { margin: 0; background: #0b0820; }
+      canvas { display: block; width: 100vw; max-width: 1920px; }
+    </style>
+  </head>
+  <body>
+    <canvas id="stage" width="1920" height="1080"></canvas>
+    <script>
+      // one page plays any episode: player.html?ep=ep01&t=12.5   (or &poses=guard,jab to check key poses)
+      window.PEN_SIZE = [1920, 1080];
+      const Q = new URLSearchParams(location.search), EPDIR = "episodes/" + (Q.get("ep") || "ep01") + "/";
+      const load = (src) => new Promise((ok, no) => { const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = () => no(new Error("failed to load " + src)); document.head.appendChild(s); });
+      (async () => {
+        for (const f of ["engine/vendor/three.min.js", "engine/vendor/pen.js", "engine/vendor/rig.js", "engine/vendor/rig_fine.js", "engine/stage.js", "engine/act.js", "engine/fx.js", EPDIR + "set.js", EPDIR + "cast.js", EPDIR + "shots.js"]) await load(f);
+        const P = PEN, { W, H, clamp } = PEN, EP = window.EP, SHOTS = window.SHOTS;
+        const cv = document.getElementById("stage"), g = cv.getContext("2d");
+        const paper = P.makePaper(); P.paperTex = paper;
+        STAGE.use(EP.set);
+        const D = EP.shots[EP.shots.length - 1].e; EP.D = D;
+        const shotAt = (t) => EP.shots.find((s) => t >= s.s && t < s.e) || EP.shots[EP.shots.length - 1];
+
+        function frame(t) {
+          t = clamp(t, 0, D - 1e-4);
+          const sh = shotAt(t), fn = SHOTS[sh.id]; if (!fn) throw new Error("no shot " + sh.id);
+          const step = (fps) => Math.floor(t * fps + 1e-6) / fps;
+          P.setTime(t);
+          g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+          // the shot describes the frame; nothing is painted until the camera and shake are known
+          const items = [], under = [], over = [];
+          const c = { g, t, sh, u: clamp((t - sh.s) / (sh.e - sh.s)), lt: t - sh.s, tq: step(12), step, env: { dawn: 0 }, blank: null, near: false, nearZ: 1e9,
+            cam: (pos, look, fov = 40, roll = 0) => P.camera(pos, look, fov, roll),
+            shake: (amp, seed = 1) => P.shake(amp, t, seed),
+            add: (at, fn2) => items.push({ z: typeof at === "number" ? at : P.depth(at), fn: fn2 }),
+            under: (fn2) => under.push(fn2), over: (fn2) => over.push(fn2),
+            // an actor, depth-sorted with everything else. o.t overrides the time it is sampled at (default: on twos)
+            actor: (A, o = {}) => { const tt = o.t ?? step(o.fps || 12), st = A.at(tt); if (st.hide) return null; const J = A.J(tt), z = P.depth(J.chest); c.nearZ = Math.min(c.nearZ, z - 0.9); items.push({ z, fn: () => A.draw(g, tt, Object.assign({ ground: EP.ground }, EP.actorDefaults, c.actorOpts, o)) }); return J; } };
+          fn(c);
+          if (!P.cam) throw new Error("shot " + sh.id + " set no camera");
+          if (c.blank) { g.fillStyle = c.blank; g.fillRect(0, 0, W, H); } else STAGE.paint(g, c.env, t);
+          for (const f of under) f(g);
+          items.sort((a, b) => b.z - a.z); for (const it of items) it.fn(g);
+          if (c.near && !c.blank && c.nearZ < 1e8) STAGE.paintNear(g, c.nearZ);
+          for (const f of over) f(g);
+          // a breath of paper grain over everything, so the 3D and the drawing sit on one page
+          g.save(); g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = "multiply"; g.globalAlpha = 0.5; g.drawImage(paper, 0, 0); g.restore();
+          if (EP.chip && !c.noChip) EP.chip(g, t);
+          P.cam.shakeX = 0; P.cam.shakeY = 0;
+        }
+        // key-pose check sheet: every named pose from the front-quarter and the side
+        function poseSheet(names) {
+          g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = "#6a59c9"; g.fillRect(0, 0, W, H);
+          const cols = Math.ceil(names.length / 2) || 1, cw = W / cols, ch = H / 2, A = window.CAST[Q.get("who") || Object.keys(window.CAST)[0]];
+          names.forEach((nm, i) => {
+            const cx = (i % cols) * cw + cw / 2, cy = Math.floor(i / cols) * ch + ch / 2;
+            [[2.6, 1.1, 3.4, -cw / 4], [4.2, 1.0, 0.01, cw / 4]].forEach(([x, y, z, dx]) => {
+              P.camera([x, y, z], [0, 0.95, 0.1], 30);
+              g.save(); g.translate(cx + dx - W / 2, cy - H / 2 + 20); g.translate(W / 2, H / 2); g.scale(0.62, 0.62); g.translate(-W / 2, -H / 2);
+              const pose = ACT.pose(nm), J = ACT.solve({ pos: [0, 0, 0], face: 0, pose });
+              RIG.draw(g, { pos: [0, 0, 0], face: 0, pose: {}, J, legsFree: J.legsFree, kind: A.kind, look: A.look, seed: A.seed, shadow: false });
+              if (A.prop) { P.STYLE.inFigure = true; A.prop(g, J, 2.4, {}); P.STYLE.inFigure = false; }
+              g.restore();
+            });
+            g.fillStyle = "#fff"; g.font = '700 26px "Archivo"'; g.textAlign = "center"; g.fillText(nm, cx, Math.floor(i / cols) * ch + 34);
+          });
+        }
+        window.__frameAt = async (t) => frame(t);
+        window.__poseSheet = async (names) => poseSheet(names);
+        window.__ready = true;
+        await document.fonts.load('900 80px "Archivo"'); await document.fonts.ready;
+        if (Q.has("poses")) poseSheet(Q.get("poses").split(","));
+        else if (Q.has("t")) frame(+Q.get("t"));
+        else { const t0 = performance.now(); const tick = () => { frame(((performance.now() - t0) / 1000) % D); requestAnimationFrame(tick); }; tick(); }
+      })().catch((e) => { document.title = "error"; window.__error = String((e && e.stack) || e); console.error(e); });
+    </script>
+  </body>
+</html>
